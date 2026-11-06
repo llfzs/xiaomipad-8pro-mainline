@@ -1,13 +1,18 @@
 name: SunUEFI build products
 
 # 需求 6：在 GitHub 上构建三产物 SunUEFI-Module / SunUEFI-ESP / SunUEFI-Root-<target>。
+# 需求 3 的核心：主干用 yzddmr6/xiaomipad-8pro-mainline 的源码/构建成品，一直跟着更新。
+#   * fork 的 main = 上游源码 + port/ 叠加层（git merge upstream/main 零冲突）；
+#   * 上游不在 CI 编译（仓库无 workflow），成品按 tag 发 Release。因此默认构建路径
+#     source=upstream-release：自动拉上游最新 Release 的 boot.zip / rootfs 分卷 /
+#     tools.zip，校验 SHA256SUMS.assets，经 port/ 层 UEFI 化后产出**真镜像**；
+#   * 上游发新版 -> sync workflow 检测到并 dispatch 本构建，自动跟随，无需改 tag。
 # 需求 7：把三产物发布到 GitHub Release（publish job）：
 #   * push tag v*        -> 构建完成后自动发布到该 tag
 #   * workflow_dispatch  -> 勾 publish_release 手动发布（可不打 tag，自动生成 port-<sha>）
 #   * 另有 sunuefi-release.yml 用于「不重新编译、从已有 run 补发/重发」。
 # 发布门禁：占位骨架产物（只有 README.txt）强制降级为草稿+预发布，不冒充正式版。
-# 需求 3：UEFI 全部位于 port/ 与 .github/workflows/sunuefi-*，零上游文件修改，
-#         同步上游 merge 后 push 到 main 会触发本构建；tag push 不评估 paths 过滤。
+# 高级可选 source=kernel-source：从内核源码重新编译（需外部输入，见 docs/RELEASE.md）。
 on:
   push:
     branches: [main]
@@ -25,7 +30,7 @@ on:
       - 'initramfs/**'
       - 'packaging/**'
   repository_dispatch:
-    types: [upstream-synced]
+    types: [upstream-synced, upstream-release]
   workflow_dispatch:
     inputs:
       target:
@@ -33,12 +38,21 @@ on:
         type: choice
         options: [all, ubuntu-gnome, debian-gnome, debian-kde, nyarch-gnome, steamos]
         default: all
-      full_build:
-        description: '真实编译：调用 port/build/port-full-build.sh 编译内核并产出 ESP 镜像（需 ARM64 runner + 外部输入目录；缺输入会直接失败）'
+      source:
+        description: '构建输入源：upstream-release=拉上游最新 Release 成品（默认，跟着上游更新）；kernel-source=从内核源码重编（等价于旧 full_build，需外部输入）；skeleton=只跑骨架自检'
+        type: choice
+        options: [upstream-release, kernel-source, skeleton]
+        default: upstream-release
+      upstream_tag:
+        description: '指定上游 Release tag（留空=自动取 yzddmr6 最新 latest，跟随上游更新）'
+        type: string
+        default: ''
+      skip_root:
+        description: '跳过 3.5GB rootfs 分卷下载（仅用于快速验证 ESP/Module 链路；root 产物会缺失，发布门禁将拦截）'
         type: boolean
         default: false
       external_inputs_dir:
-        description: '外部输入目录（initramfs.cpio.gz / root.ext4 / SunUEFI-Piano-*.zip / 原厂 DTB），相对仓库根'
+        description: '外部输入目录（仅 kernel-source 路径使用），相对仓库根'
         type: string
         default: 'port/inputs'
       publish_release:
@@ -113,7 +127,12 @@ jobs:
       matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
     env:
       SUNUEFI_TARGET: ${{ matrix.target }}
-      FULL_BUILD: ${{ inputs.full_build && '1' || '0' }}
+      # 默认永远用上游最新 Release 成品（上游发新版自动跟随，不写死 tag）。
+      # 只有显式选 source=kernel-source 才走从源码重编的高级路径。
+      SOURCE: ${{ inputs.source || github.event.client_payload.source || 'upstream-release' }}
+      UPSTREAM_TAG: ${{ inputs.upstream_tag || github.event.client_payload.upstream_tag || '' }}
+      SKIP_ROOT: ${{ inputs.skip_root && '1' || '0' }}
+      FULL_BUILD: ${{ (inputs.source || github.event.client_payload.source || 'upstream-release') == 'kernel-source' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,20 +140,75 @@ jobs:
           submodules: false
           persist-credentials: false
 
+      - name: 释放 runner 磁盘（上游 rootfs 为 60GiB sparse）
+        if: env.SOURCE == 'upstream-release'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android 2>/dev/null || true
+          df -h .
+
+      - name: 安装构建依赖（zstd / mtools / unzip）
+        if: env.SOURCE != 'skeleton'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd mtools dosfstools lz4 unzip e2fsprogs
+
       - name: 主机工具检查
         run: |
           python3 --version
           bash port/verify-port.sh . >/dev/null && echo "port 层自检通过"
 
-      # ---- Stage B（FULL_BUILD=true）：真实编译接线，失败即 job 失败 ----
-      # 旧版这里是 "echo 示例 + || true"，跑绿但不产出任何镜像；现已换成
-      # port/build/port-full-build.sh：真实 clone/校验内核源码、跑 build-kernel.sh、
-      # 生成 FAT32 ESP raw 镜像，并写 port-inputs.env 给下一步消费。
-      # 设备/发行版专属产物（initramfs / root 镜像 / Module ZIP / 原厂 DTB）
-      # 由 --external-inputs 目录提供；缺失会明确报错，绝不静默产出占位。
+      # ---- 默认路径：消费上游最新 Release 成品（由上游源码编译发布） ----
+      # 这是「主干用上游源码、一直跟着更新」的落地点：不重编内核，只把上游按 tag
+      # 发布的 boot.zip / rootfs 分卷 / tools.zip 拉下来，校验后做 UEFI 化后处理。
+      # 上游发新版 -> sync workflow dispatch -> 这里自动拉新 tag，无需改任何配置。
+      - name: '[上游 Release] 拉取 yzddmr6 最新成品 -> UEFI 三产物真镜像'
+        id: upstream
+        if: env.SOURCE == 'upstream-release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: yzddmr6/xiaomipad-8pro-mainline
+        run: |
+          set -euo pipefail
+          PORT_INPUTS="$RUNNER_TEMP/port-inputs"
+          mkdir -p "$PORT_INPUTS"
+          ARGS=(--fork "$PWD" --inputs "$PORT_INPUTS" --repo "$UPSTREAM_REPO")
+          if [ -n "$UPSTREAM_TAG" ]; then ARGS+=(--tag "$UPSTREAM_TAG"); fi
+          if [ "$SKIP_ROOT" = '1' ]; then ARGS+=(--skip-root); fi
+          bash port/build/port-from-upstream-release.sh "${ARGS[@]}"
+          # shellcheck disable=SC1090
+          source "$PORT_INPUTS/port-inputs.env"
+          echo "inputs=$INPUTS_DIR" >> "$GITHUB_OUTPUT"
+          echo "esp=${ESP_IMAGE:-}" >> "$GITHUB_OUTPUT"
+          echo "root=${ROOT_IMAGE:-}" >> "$GITHUB_OUTPUT"
+          echo "module=${MODULE_ZIP:-}" >> "$GITHUB_OUTPUT"
+          echo "status=${FULL_BUILD_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "tag=${UPSTREAM_TAG:-}" >> "$GITHUB_OUTPUT"
+          echo "::notice::上游 ${UPSTREAM_TAG:-latest} -> UEFI 化状态 ${FULL_BUILD_STATUS:-UNKNOWN}"
+          {
+            echo "### 上游 Release 构建（主干 = 上游源码）"
+            echo "- 上游 tag: \`${UPSTREAM_TAG:-latest}\`（未写死，自动跟随上游最新）"
+            echo "- 上游仓库: \`$UPSTREAM_REPO\`"
+            echo "- 状态: \`${FULL_BUILD_STATUS:-UNKNOWN}\`"
+            echo "- 说明: 消费上游按 tag 发布的编译成品，经 port/ 层 UEFI 化；不重编内核"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传上游溯源清单
+        if: env.SOURCE == 'upstream-release' && steps.upstream.outputs.inputs != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-release-meta-${{ matrix.target }}
+          path: |
+            ${{ steps.upstream.outputs.inputs }}/upstream-release.json
+            ${{ steps.upstream.outputs.inputs }}/upstream-adapt.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ---- 高级可选（source=kernel-source）：从内核源码重新编译 ----
+      # 旧版唯一路径，需要 QEMU chroot / Ubuntu ISO / 原厂 DTB / 签名密钥等外部输入，
+      # 公共 runner 无法提供；保留给自建 runner。失败即 job 失败，不静默产占位。
       - name: '[FULL_BUILD] 上游真实编译接线（内核 + ESP 镜像）'
         id: fullbuild
-        if: env.FULL_BUILD == '1'
+        if: env.SOURCE == 'kernel-source'
         env:
           EXTERNAL_DIR: ${{ inputs.external_inputs_dir || 'port/inputs' }}
         run: |
@@ -143,7 +217,7 @@ jobs:
           PORT_INPUTS="$RUNNER_TEMP/port-inputs"
           mkdir -p "$PORT_INPUTS"
           ARGS=(--fork "$PWD" --inputs "$PORT_INPUTS" --esp-size-mib 512)
-          [ -n "$EXTERNAL_DIR" ] && ARGS+=(--external-inputs "$PWD/$EXTERNAL_DIR")
+          if [ -n "$EXTERNAL_DIR" ]; then ARGS+=(--external-inputs "$PWD/$EXTERNAL_DIR"); fi
           bash port/build/port-full-build.sh "${ARGS[@]}"
           # 导出真实产物路径给「组装三产物」步骤
           # shellcheck disable=SC1090
@@ -156,16 +230,15 @@ jobs:
           echo "::notice::FULL_BUILD 状态: ${FULL_BUILD_STATUS:-UNKNOWN}（见 port-inputs-manifest.json）"
 
       # ---- Stage A：port 层后处理 + 三产物打包 ----
-      # FULL_BUILD 开启时把 --inputs / --esp-image / --root-image / --module-zip
-      # 全部传给 port-build.sh，使其产出真实 sparse 镜像而非占位骨架。
+      # 两条来源（上游 Release / 源码编译）共用同一组 outputs，全部传真镜像参数。
       # 去掉旧版的 "|| true"：打包失败则 job 失败，不再静默成功。
       - name: 组装三产物（账号/挂载/ESP/打包）
         env:
-          FB_INPUTS: ${{ steps.fullbuild.outputs.inputs }}
-          FB_ESP: ${{ steps.fullbuild.outputs.esp }}
-          FB_ROOT: ${{ steps.fullbuild.outputs.root }}
-          FB_MODULE: ${{ steps.fullbuild.outputs.module }}
-          LEGACY_MODULE: ${{ inputs.full_build && 'artifacts/android/SunUEFI-Piano.zip' || '' }}
+          FB_INPUTS: ${{ steps.upstream.outputs.inputs || steps.fullbuild.outputs.inputs }}
+          FB_ESP: ${{ steps.upstream.outputs.esp || steps.fullbuild.outputs.esp }}
+          FB_ROOT: ${{ steps.upstream.outputs.root || steps.fullbuild.outputs.root }}
+          FB_MODULE: ${{ steps.upstream.outputs.module || steps.fullbuild.outputs.module }}
+          LEGACY_MODULE: ${{ inputs.source == 'kernel-source' && 'artifacts/android/SunUEFI-Piano.zip' || '' }}
         run: |
           set -euo pipefail
           mkdir -p artifacts/downloads
@@ -257,6 +330,14 @@ jobs:
           path: release-download
           merge-multiple: false
 
+      - name: 下载上游溯源清单
+        uses: actions/download-artifact@v4
+        with:
+          pattern: upstream-release-meta-*
+          path: upstream-meta
+          merge-multiple: true
+        continue-on-error: true
+
       - name: 生成 Release 资产（ZIP + 全局 SHA256SUMS + manifest + 说明）
         id: assets
         env:
@@ -266,6 +347,13 @@ jobs:
           set -euo pipefail
           TAG="${TAG_FROM_REF:-${TAG_FROM_INPUT:-port-$(git rev-parse --short HEAD)}}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # 把真实上游 Release tag 写进说明，供 sync workflow 去重检测
+          UP_TAG=$(python3 -c 'import json,glob; p=glob.glob("upstream-meta/**/upstream-release.json",recursive=True); print(json.load(open(p[0])).get("tag","") if p else "")' 2>/dev/null || true)
+          BASELINE="yzddmr6/xiaomipad-8pro-mainline@main"
+          if [ -n "$UP_TAG" ]; then
+            BASELINE="yzddmr6/xiaomipad-8pro-mainline@$UP_TAG (source-build)"
+          fi
+          echo "上游基线: $BASELINE"
           python3 port/tools/port-release-assets.py \
             --artifacts release-download \
             --out release-assets \
@@ -274,7 +362,7 @@ jobs:
             --repo "$GH_REPO" \
             --run-id "${{ github.run_id }}" \
             --commit "${{ github.sha }}" \
-            --upstream-baseline "yzddmr6/xiaomipad-8pro-mainline@main" \
+            --upstream-baseline "$BASELINE" \
             --json | tee release-summary.json
 
       - name: 应用发布门禁（占位骨架不得作为正式版）

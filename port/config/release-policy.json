@@ -14,7 +14,7 @@
     "on_placeholder": "draft_prerelease",
     "allow_override_input": "allow_placeholder_release",
     "flags_file": "release-flags.env",
-    "message": "检测到占位产物（目录里只有 README.txt，不是可刷镜像）。本次发布强制降级为草稿 + 预发布；如需正式发布，请先完成 FULL_BUILD 真实编译产出真镜像，或在手动发布时显式勾选 allow_placeholder_release。",
+    "message": "检测到占位产物（目录里只有 README.txt，不是可刷镜像）。本次发布强制降级为草稿 + 预发布；默认 source=upstream-release 会拉上游最新 Release 成品产出真镜像，无需手动编译；如需正式发布请确认三产物均为 READY，或在手动发布时显式勾选 allow_placeholder_release。",
     "note": "门禁由 port-release-assets.py 在生成资产时判定，输出 release-flags.env；两个 publish job source 该文件后覆盖 --draft/--prerelease。flags 文件只是 CI 中间产物，不进 upload-files.txt 与 SHA256SUMS。"
   },
   "upload_files": [
@@ -38,7 +38,7 @@
     "safety_reminder": [
       "刷机有变砖风险：首次先 fastboot boot 内存试运行，备份原厂 BOOT 并确认可还原。",
       "不刷 vbmeta/dtbo、不碰 B 槽、不格式化 userdata；电量 >= 40%。",
-      "占位产物（README.txt）不是可刷镜像；真镜像须经完整内核/rootfs/UEFI 编译后替换。",
+      "占位产物（README.txt）不是可刷镜像；默认构建直接消费上游 yzddmr6 最新 Release 成品并 UEFI 化，产出真实镜像后才会 GUARD_CLEAR。",
       "下载后先执行 sha256sum -c SHA256SUMS 校验完整性。"
     ]
   },

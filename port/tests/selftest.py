@@ -12,6 +12,8 @@
   - 发布门禁：真实产物 GUARD_CLEAR / 占位 GUARD_TRIGGERED + release-flags.env  [需求7 补强]
   - port-check-isolation.py：正例通过、上游改动触及命名空间负例被拦截  [需求3]
   - port-full-build.sh --dry-run：上游元数据/内核 commit/fragments/输出契约  [真实编译接线]
+  - port-upstream-release.py adapt：上游 Release 成品 -> UEFI 输入（解 Android Boot Image、
+    SUNUEFI-LINUXv2 ESP、真实 Module ZIP、port-inputs.env 契约）[需求 3 上游活水]
 
 参数：套件根 KIT（含 overlay/port/... 或已 apply 后含 port/...）。
 """
@@ -355,7 +357,74 @@ def main() -> int:
         assert "ESP_IMAGE=" in fb_env and "ROOT_IMAGE=" in fb_env
         print("  [full-build] --dry-run 元数据/源码契约/输出契约 OK")
 
-    print("\nSELFTEST OK —— 需求 1/2/3/4/5/7 + 真实编译接线 + 发布门禁 全部离线跑通")
+        # ---- 9. 上游 Release 适配器（默认构建路径，纯 Python 离线覆盖）----
+        # 不依赖 zstd/mtools：只验证 adapt 的解包/ESP/Module/契约逻辑。
+        import gzip
+        import zipfile
+        adapter = tools / "port-upstream-release.py"
+        # KIT 模式 tests/ 在套件根；落地树模式 tests/ 在 port/ 内
+        fixture_gen = portroot / "tests" / "make_upstream_fixture.py"
+        if not fixture_gen.is_file():
+            fixture_gen = kit / "tests" / "make_upstream_fixture.py"
+        if adapter.is_file():
+            ur_fork = d / "ur_fork"
+            shutil.copytree(portroot, ur_fork / "port")
+            ur_inputs = d / "ur_inputs"
+            ur_inputs.mkdir()
+            tag = "v1.0.0-selftest"
+            # 合成上游 boot.zip（Android Boot Image v2 + 完整合并 DTB）
+            kernel = bytearray(128 * 1024)
+            kernel[:40] = b"Linux version 7.2.14-piano56 selftest\x00"[:40]
+            ramdisk = gzip.compress(b"070701" + b"selftest initramfs" * 64, mtime=0)
+            page, hsize = 4096, 1660
+            bh = bytearray(hsize)
+            bh[0:8] = b"ANDROID!"
+            struct.pack_into("<I", bh, 8, len(kernel))
+            struct.pack_into("<I", bh, 16, len(ramdisk))
+            struct.pack_into("<I", bh, 36, page)
+            struct.pack_into("<I", bh, 40, 2)
+            struct.pack_into("<I", bh, 1644, hsize)
+            boot = bytearray(page)
+            boot[:hsize] = bh
+            boot += kernel
+            boot += b"\x00" * ((page - len(boot) % page) % page)
+            boot += ramdisk
+            boot += b"\x00" * ((page - len(boot) % page) % page)
+            dtb = bytearray(256)
+            dtb[0:4] = b"\xd0\x0d\xfe\xed"
+            struct.pack_into(">I", dtb, 4, len(dtb))
+            with zipfile.ZipFile(ur_inputs / f"piano-ubuntu-{tag}-boot.zip", "w") as z:
+                z.writestr("boot/boot.img", bytes(boot))
+                z.writestr("boot/piano-boot.dtb", bytes(dtb))
+            (ur_inputs / "upstream-release.json").write_text(json.dumps({
+                "schema": 1, "source": "upstream-release", "tag": tag,
+                "repo": "yzddmr6/xiaomipad-8pro-mainline",
+                "target_commitish": "selftest-commit"}))
+            r5 = subprocess.run([sys.executable, str(adapter), "adapt",
+                                 "--fork", str(ur_fork), "--inputs", str(ur_inputs),
+                                 "--tag", tag], capture_output=True, text=True)
+            assert r5.returncode == 0, f"adapt 失败: {r5.stderr}"
+            assert (ur_inputs / "Image").read_bytes() == bytes(kernel)
+            assert (ur_inputs / "initramfs.cpio.gz").read_bytes() == ramdisk
+            assert (ur_inputs / "piano-boot.dtb").read_bytes() == bytes(dtb)
+            env = (ur_inputs / "port-inputs.env").read_text()
+            for token in ("SOURCE=upstream-release", f"UPSTREAM_TAG={tag}",
+                          "DTB_STATUS=UPSTREAM_MERGED_DTB", "ESP_DIR=", "MODULE_ZIP="):
+                assert token in env, f"port-inputs.env 缺 {token}"
+            esp_manifest = json.loads((ur_inputs / "esp-tree/port-esp-manifest.json").read_text())
+            assert esp_manifest["payload"]["magic"] == "SUNUEFI-LINUXv2"
+            modzip = ur_inputs / f"SunUEFI-Piano-{tag}.zip"
+            assert modzip.is_file()
+            with zipfile.ZipFile(modzip) as z:
+                names = z.namelist()
+                for req in ("module.prop", "service.sh", "payload/etc/shadow",
+                            "payload/etc/fstab", "payload/etc/piano/root-policy.json",
+                            "partition-plan.json"):
+                    assert req in names, f"Module ZIP 缺 {req}"
+                assert b"piano" in z.read("payload/etc/passwd")
+            print("  [upstream-release] 解 Boot Image / ESP payload / 真实 Module / 契约 OK")
+
+    print("\nSELFTEST OK —— 需求 1/2/3/4/5/7 + 上游 Release 接线 + 真实编译接线 + 发布门禁 全部离线跑通")
     return 0
 
 

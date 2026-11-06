@@ -27,6 +27,9 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-24.04
+    env:
+      # secrets 不能用于 if，且 step 级 env 在 if 求值时不可见 -> 提到 job 级
+      HAS_PAT: ${{ secrets.SYNC_TOKEN != '' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,13 +89,41 @@ jobs:
       - name: 触发三产物重建
         if: steps.check.outputs.behind != '0' && inputs.dry_run != true && env.HAS_PAT == 'true'
         env:
-          HAS_PAT: ${{ secrets.SYNC_TOKEN != '' && 'true' || 'false' }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           curl -sS -X POST \
             -H "Authorization: Bearer ${{ secrets.SYNC_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/dispatches" \
             -d '{"event_type":"upstream-synced"}' && echo "已派发 upstream-synced 事件"
+
+      # 上游不在 CI 编译，镜像按 tag 发 Release。除了同步 git commit，也要检测
+      # 「上游发了新 Release」并派发重建，否则上游更新镜像但源码没动时会漏掉。
+      # if 里用 secrets 直接判定（step 级 env 在 if 求值时不可见）；requires SYNC_TOKEN。
+      - name: 检测上游最新 Release 并派发重建
+        if: inputs.dry_run != true && env.HAS_PAT == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh api repos/yzddmr6/xiaomipad-8pro-mainline/releases/latest --jq '.tag_name')
+          echo "上游最新 Release tag = $TAG"
+          NEEDLE="yzddmr6/xiaomipad-8pro-mainline@$TAG"
+          # 本 fork 的 Release 说明里记录了基线 tag（见 port-release-assets.py）
+          ALREADY=$(gh api "repos/$REPO/releases?per_page=30" \
+                    --jq "[.[] | select((.body // \"\") | contains(\"$NEEDLE\"))] | length" 2>/dev/null || echo 0)
+          if [ "$ALREADY" != "0" ]; then
+            echo "本 fork 已有对应 $TAG 的 Release，跳过派发"
+          else
+            echo "上游 $TAG 尚无对应构建，派发 upstream-release 事件"
+            curl -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/dispatches" \
+              -d "{\"event_type\":\"upstream-release\",\"client_payload\":{\"upstream_tag\":\"$TAG\",\"source\":\"upstream-release\"}}"
+          fi
+          echo "- 上游最新 Release: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
 
       # 需求 7 可选：同步完直接打 tag，触发 sunuefi-build.yml 的 publish job 自动发布
       # 必须配 SYNC_TOKEN（PAT）：GITHUB_TOKEN 的 push 不会再触发别的 workflow。

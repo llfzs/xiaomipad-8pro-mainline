@@ -36,8 +36,10 @@ for f in \
   tools/port-stage-esp.py tools/port-adapt-rootfs.py tools/port-partition-plan.py \
   tools/port-inject-login.py tools/port-package-artifacts.py tools/port-release-assets.py \
   tools/port-check-isolation.py tools/port-sync-upstream.sh tools/port-switch.sh \
-  build/port-build.sh build/port-full-build.sh \
-  docs/PORTING-MAP.md docs/REQUIREMENTS.md docs/SYNC-UPSTREAM.md docs/RELEASE.md; do
+  tools/port-upstream-release.py \
+  build/port-build.sh build/port-full-build.sh build/port-from-upstream-release.sh \
+  docs/PORTING-MAP.md docs/REQUIREMENTS.md docs/SYNC-UPSTREAM.md docs/RELEASE.md \
+  docs/UPSTREAM-RELEASE.md; do
   [ -f "$PORTROOT/$f" ] || fail "缺文件 port/$f"
 done
 pass "port/ 关键文件齐全（含需求 3/4/5/7 脚本、真实编译接线器与文档）"
@@ -49,7 +51,9 @@ from pathlib import Path
 root = Path(sys.argv[1])
 files = list((root/'tools').glob('*.py'))
 tests = root/'tests/selftest.py'
+fixture = root/'tests/make_upstream_fixture.py'
 if tests.exists(): files.append(tests)
+if fixture.exists(): files.append(fixture)
 for p in files:
     ast.parse(p.read_text(), filename=str(p))
 print(f"  parsed {len(files)} python files")
@@ -98,7 +102,11 @@ assert guard['allow_override_input'] == 'allow_placeholder_release'
 assert guard['flags_file'] == 'release-flags.env'
 assert 'port/tools/port-release-assets.py' in sync['isolation_rules']['protected_port_files']
 assert 'port/build/port-full-build.sh' in sync['isolation_rules']['protected_port_files']
-print('  profile/distros/sync/release-policy 需求字段 OK（含发布门禁 + 真实编译接线器登记）')
+# 需求 3 补强：上游 Release 适配器必须登记为受保护文件
+protected = sync['isolation_rules']['protected_port_files']
+assert 'port/tools/port-upstream-release.py' in protected, '缺上游 Release 适配器登记'
+assert 'port/build/port-from-upstream-release.sh' in protected, '缺上游 Release 编排器登记'
+print('  profile/distros/sync/release-policy 需求字段 OK（含发布门禁 + 上游 Release 接线）')
 PY
 pass "配置合法（分区/账号/产物/同步/发布字段）"
 
@@ -141,6 +149,11 @@ for token in ('port/build/port-full-build.sh', '--external-inputs',
               '--inputs "$FB_INPUTS"', '--esp-image', '--root-image', '--module-zip',
               'port-inputs.env', 'FULL_BUILD'):
     assert token in build_text, f"构建 workflow 缺真实接线要素: {token}"
+# 需求 3 补强：默认输入源必须是上游最新 Release 成品（跟着上游更新）
+for token in ('source:', 'upstream-release', 'upstream-release-meta',
+              'port-from-upstream-release.sh', 'SHA256SUMS.assets',
+              'SOURCE', 'UPSTREAM_TAG', 'client_payload.upstream_tag'):
+    assert token in build_text, f"构建 workflow 缺上游 Release 接线要素: {token}"
 assert 'tee build-port.log || true' not in build_text, '组装步骤仍用 || true 掩盖失败'
 # 发布门禁：两个 workflow 都必须有
 for token in ('allow_placeholder_release', 'release-flags.env', 'FORCE_DRAFT',
@@ -159,9 +172,12 @@ for token in ('workflow_dispatch:', 'gh run download', 'port-release-assets.py',
               'allow_placeholder_release', 'release-flags.env', 'FORCE_DRAFT',
               '应用发布门禁'):
     assert token in rel_text, f"补发 workflow 缺 {token}"
-# 同步 workflow：可选同步后打发布 tag
-assert 'release_tag_after_sync' in (wf/'sunuefi-sync-upstream.yml').read_text()
-print(f'  {len(files)} 个 workflow：三产物 + 真实编译接线 + 发布门禁校验通过')
+# 同步 workflow：可选同步后打发布 tag + 检测上游最新 Release 并派发
+sync_text = (wf/'sunuefi-sync-upstream.yml').read_text()
+assert 'release_tag_after_sync' in sync_text
+for token in ('releases/latest', 'upstream-release', 'client_payload', 'HAS_PAT'):
+    assert token in sync_text, f"同步 workflow 缺上游 Release 检测要素: {token}"
+print(f'  {len(files)} 个 workflow：三产物 + 上游 Release 接线 + 发布门禁校验通过')
 PY
   pass "Actions YAML（三产物命名 + 需求 7 发布链路）"
 else
