@@ -47,7 +47,8 @@
 - `config/port-profile.json` —— 分区（`sunuefi_esp`/`sunuefi_root`/`PIANOROOT`）、cmdline、内核 config 要求、**login（piano/piano/root）**、artifacts 定义
 - `config/distros.json` —— 发行版矩阵（默认 `ubuntu-gnome`，扩展位对齐 SunUEFI 四发行版）
 - `config/upstream-sync.json` —— 上游同步策略、两个自有命名空间、受管路径白名单、冲突策略
-- `config/release-policy.json` —— **需求 7**：tag 前缀/触发、draft/prerelease、clobber、Release 上传清单
+- `config/release-policy.json` —— **需求 7**：tag 前缀/触发、draft/prerelease、clobber、Release 上传清单；
+  **`placeholder_guard` 发布门禁**（schema 2）
 - `tools/port-stage-esp.py` —— 内核四件套 → ESP 布局 + `SUNUEFI-LINUXv2` payload
 - `tools/port-adapt-rootfs.py` —— rootfs 挂载契约（fstab/root-policy/udev）
 - `tools/port-inject-login.py` —— **账号 piano/piano + root piano + 自动登录**
@@ -57,17 +58,27 @@
 - `tools/port-sync-upstream.sh` —— **上游同步（--check/--merge + 命名空间冲突预检）**
 - `tools/port-switch.sh` —— 切换接线（BootRequest 语义）
 - `tools/port-release-assets.py` —— **需求 7**：三产物目录→同名 ZIP + 全局 SHA256SUMS +
-  `manifest.json` + `RELEASE-NOTES.md` + `upload-files.txt`（规避各目录 `SHA256SUMS` 重名覆盖）
+  `manifest.json` + `RELEASE-NOTES.md` + `upload-files.txt`（规避各目录 `SHA256SUMS` 重名覆盖）；
+  **发布门禁**：额外输出 `release-flags.env`（`FORCE_DRAFT`/`FORCE_PRERELEASE`）与 `publish_guard`
 - `build/port-build.sh` —— CI/本地构建编排总入口
+- `build/port-full-build.sh` —— **真实编译接线器**（`FULL_BUILD=true`）：从 `kernel/source.json`
+  读固定 commit → clone/校验内核源码 → 检查交叉工具链 → 跑 `tools/build-kernel.sh` →
+  生成 4K 对齐 FAT32 `esp.raw` → 写 `port-inputs.env` / `port-inputs-manifest.json`；
+  严格模式，缺输入即失败，**不静默产出占位**
+- `port/inputs/`（你自己创建）—— 放本机构建的 `initramfs.cpio.gz` / `root.ext4` /
+  `SunUEFI-Piano-*.zip` / 原厂 DTB；大文件用 LFS 或自建 runner 预置
 - `tests/selftest.py`（apply 时复制进 `port/tests/`）、`verify-port.sh`
 - `docs/*` —— 本文件、REQUIREMENTS、SYNC-UPSTREAM、**RELEASE（发布手册）**、接线清单、subtree 引用清单
 
 ### `.github/workflows/`（新增，带 `sunuefi-` 前缀）
 - `sunuefi-build.yml` —— push（含 `v*` tag）/dispatch/repository_dispatch，`ubuntu-24.04-arm`，
   matrix，三 `upload-artifact` 命名严格对齐 SunUEFI `build-products.yml`；
+  **`FULL_BUILD=true` 真实接线**：`port-full-build.sh` → `port-inputs.env` →
+  `--inputs/--esp-image/--root-image/--module-zip` 全量传给 `port-build.sh`（无 `|| true` 掩盖）；
   **`publish` job**（需求 7）：`download-artifact` → `port-release-assets.py` →
-  `gh release create/upload --clobber`，job 级 `contents: write`
-- `sunuefi-release.yml` —— **需求 7**：手动补发/重发，`gh run download` 复用已有成功 run，不重新编译
+  **发布门禁** → `gh release create/upload --clobber`，job 级 `contents: write`
+- `sunuefi-release.yml` —— **需求 7**：手动补发/重发，`gh run download` 复用已有成功 run，
+  不重新编译；**同样带发布门禁**
 - `sunuefi-sync-upstream.yml` —— 每周定时 + 手动，合并上游并触发重建；
   可选 `release_tag_after_sync` 同步后自动打 tag 发版
 
@@ -98,22 +109,39 @@
 
 ## 4. 构建接线（零上游修改）
 
-完整流水线见 `build/port-build.sh` 与 `.github/workflows/sunuefi-build.yml`：
+完整流水线见 `build/port-build.sh`、`build/port-full-build.sh` 与
+`.github/workflows/sunuefi-build.yml`：
 
 ```
-[上游原样构建]  build-kernel.sh / prepare-boot-dtb.py / build-initramfs.sh / build-rootfs-image.py
-      │  Image  piano-boot.dtb  initramfs.cpio.gz  root.ext4/目录
+[FULL_BUILD=true]  port-full-build.sh
+   kernel/source.json(固定 commit) → clone/校验 linux-sm8750-piano
+   → tools/build-kernel.sh → Image + DTB
+   + port/inputs/*（本机产物：initramfs / root 镜像 / Module ZIP / 原厂 DTB）
+   → port-stage-esp.py → mkfs.vfat+mcopy → esp.raw(4K 对齐)
+   → port-inputs.env（ESP_IMAGE / ROOT_IMAGE / MODULE_ZIP / INPUTS_DIR）
+      │
       ▼
-[port 后处理]  port-inject-login.py  (piano/piano + root piano)
-              port-adapt-rootfs.py  (fstab -> sunuefi_root, udev 保护 Android)
-              port-stage-esp.py     (SUNUEFI-LINUXv2 ESP)
+[组装三产物]  port-build.sh --inputs ... --esp-image ... --root-image ... --module-zip ...
+   ├─ port-inject-login.py   (piano/piano + root piano，若给的是 rootfs 目录)
+   ├─ port-adapt-rootfs.py   (fstab -> sunuefi_root，udev 保护 Android)
+   └─ port-package-artifacts.py → SunUEFI-Module / -ESP / -Root-<target>（Android sparse）
+      │
       ▼
-[三产物]       port-package-artifacts.py
-              SunUEFI-Module/  SunUEFI-ESP/  SunUEFI-Root-<target>/
+[发布]  port-release-assets.py → 三 ZIP + manifest + SHA256SUMS + RELEASE-NOTES
+        + release-flags.env（占位时 GUARD_TRIGGERED → 强制草稿+预发布）
 ```
 
-CI 里 `FULL_BUILD=true` 才调用上游完整编译链（需内核源码子模块、Ubuntu apt 快照、
-专用 `mke2fs`、设备固件）；默认跑 port 层可离线部分，保证 GitHub Actions 能跑绿。
+**两条路径**：
+
+- `full_build=false`（默认）：只跑 port 层可离线部分，产物是**占位骨架**，用于验证
+  CI/发布链路；`RELEASE-NOTES.md` 标注"不可刷机"，发布门禁强制降级。
+- `full_build=true`：走上面的真实接线。**严格模式**，内核源码、交叉工具链、
+  `initramfs.cpio.gz` 等任一缺失都 `exit 1` 并给出指引，不再像旧版那样
+  "echo 示例 + `|| true`" 跑绿却不产出任何镜像。
+
+公共 runner 无法自动获得的输入（root 镜像 / Module ZIP / 原厂 DTB / 合体 BOOT / UEFI FD）
+仍需你的设备或本机提供，见 `RELEASE.md` 第 9 节。所有脚本只读上游文件、
+产物落在 `$RUNNER_TEMP`，**零上游路径写入**。
 
 ## 5. 推荐实施顺序
 

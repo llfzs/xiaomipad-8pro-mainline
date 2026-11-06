@@ -15,17 +15,21 @@ Release 的同名 asset 会互相覆盖。因此本脚本把**每个产物目录
     SHA256SUMS                    全局校验和（针对所有 zip + manifest.json）
     RELEASE-NOTES.md              人类可读发布说明（含校验和、上游基线、安全提示）
     upload-files.txt              每行一个待上传文件名，供 gh release create/upload 消费
+    release-flags.env             发布门禁标记（CI 中间产物，不上传、不计入 SHA256SUMS）
 
 设计约束：
   * ZIP 用 STORED 模式 + 固定时间戳，避免数 GB 镜像压缩耗时，且产物可复现；
     流式写入，不把整个镜像读进内存。
   * 严格校验 Module / ESP / 至少一个 Root 齐全（--allow-partial 仅供离线自检）。
+  * 发布门禁：检测到占位产物时输出 release-flags.env（FORCE_DRAFT/FORCE_PRERELEASE），
+    由 publish job source 后强制降级为草稿+预发布，避免骨架被当成正式版。
   * 只写 --out 目录，不碰上游受管目录、不联网、不调用 gh/fastboot。
 """
 import argparse
 import datetime
 import hashlib
 import json
+import shlex
 import shutil
 import sys
 import zipfile
@@ -144,7 +148,16 @@ def build_notes(meta: dict, artifacts: dict, policy: dict, sums_text: str) -> st
             "> ⚠️ **这是 CI 骨架产物，不是可刷入的固件。** 以下产物目录里只有占位 `README.txt`：",
             "> " + ", ".join(f"`{n}`" for n in placeholders) + "。",
             "> 真实镜像需在 `FULL_BUILD=true` 下完成内核 / rootfs / UEFI 编译后替换，",
-            "> 详见 `port/docs/PORTING-MAP.md` 第 4、6 节。",
+            "> 详见 `port/docs/PORTING-MAP.md` 第 4、6 节与 `port/docs/RELEASE.md`。",
+            "",
+        ]
+    guard = meta.get("publish_guard") or {}
+    if guard.get("status") == "GUARD_TRIGGERED":
+        lines += [
+            "> 🛑 **发布门禁已生效**：检测到占位产物，本次 Release 被强制创建为",
+            "> **草稿 (draft) + 预发布 (prerelease)**，不会作为正式版本发布。",
+            "> " + guard.get("message", ""),
+            "> 门禁标记见同目录 `release-flags.env`（CI 中间文件，不上传）。",
             "",
         ]
     lines += ["## 校验", "", "```bash", "sha256sum -c SHA256SUMS", "```", ""]
@@ -234,6 +247,33 @@ def main() -> int:
                    "clobber": policy["clobber"]},
     }
 
+    # ---- 发布门禁（需求 7 补强）：占位产物不得作为正式版发布 ----
+    guard_cfg = policy.get("placeholder_guard") or {}
+    guard_enabled = bool(guard_cfg.get("enabled"))
+    triggered = (guard_enabled and placeholder_count > 0
+                 and guard_cfg.get("on_placeholder") == "draft_prerelease")
+    guard_status = ("GUARD_TRIGGERED" if triggered
+                    else ("GUARD_CLEAR" if guard_enabled else "GUARD_DISABLED"))
+    guard_message = guard_cfg.get("message", "") if triggered else ""
+    publish_guard = {
+        "enabled": guard_enabled,
+        "status": guard_status,
+        "placeholder_count": placeholder_count,
+        "force_draft": triggered,
+        "force_prerelease": triggered,
+        "allow_override_input": guard_cfg.get("allow_override_input", ""),
+        "message": guard_message,
+    }
+    # CI 中间文件：可 source 的 shell 变量，publish job 据此覆盖 --draft/--prerelease。
+    # 故意不加入 upload-files.txt 与全局 SHA256SUMS。
+    (out / guard_cfg.get("flags_file", "release-flags.env")).write_text(
+        f"FORCE_DRAFT={int(triggered)}\n"
+        f"FORCE_PRERELEASE={int(triggered)}\n"
+        f"GUARD_STATUS={guard_status}\n"
+        f"GUARD_MESSAGE={shlex.quote(guard_message)}\n",
+        encoding="utf-8")
+    meta["publish_guard"] = publish_guard
+
     manifest = {
         "schema_version": 1,
         "status": status,
@@ -247,7 +287,9 @@ def main() -> int:
         "policy": meta["policy"],
         "artifacts": artifacts,
         "placeholder_count": placeholder_count,
+        "publish_guard": publish_guard,
         "warnings": (["存在占位产物，本 Release 仅验证 CI 链路，不可用于刷机"]
+                     + (["发布门禁已生效：强制草稿 + 预发布"] if triggered else [])
                      if placeholder_count else []),
         "note": "由 port/tools/port-release-assets.py 生成；仅写普通文件，不联网、不碰设备。",
     }
@@ -277,6 +319,7 @@ def main() -> int:
                           "sha256": r["sha256"], "status": r["status"]}
                       for n, r in artifacts.items()},
         "placeholder_count": placeholder_count,
+        "publish_guard": publish_guard,
         "upload_files": upload,
     }
     if a.json:

@@ -117,3 +117,94 @@ cd release-assets && sha256sum -c SHA256SUMS
 
 该命令**不联网、不调用 gh、不碰设备**，只写 `release-assets/`；已纳入
 `tests/selftest.py` 的离线自检。
+
+## 9. 为什么 Release 里不是「能直接刷入的镜像」
+
+默认构建（`full_build=false`）只跑 port 层后处理与打包。三个产物 ZIP 各约 700 B，
+里面只有一个 `README.txt` 占位说明 + 目录级 `SHA256SUMS`。`manifest.json` 会写：
+
+```json
+"status": "RELEASE_ASSETS_CONTAINS_PLACEHOLDERS",
+"placeholder_count": 3,
+"warnings": ["存在占位产物，本 Release 仅验证 CI 链路，不可用于刷机"]
+```
+
+这不是构建失败，而是**工程包定位**：它交付的是「可离线验证的移植骨架 + 桥接层」，
+用来证明 CI、三产物命名、Release 发布链路都跑通。真镜像需要下面这些**公共 runner
+无法自动获得**的输入（详见 `PORTING-MAP.md` 第 4、6 节）：
+
+| 缺的输入 | 来源 |
+|---|---|
+| 内核源码 | fork 的 `kernel/` 只有 `abi.json`/`source.json`；真实源码在 `source.json` 指向的外部仓库 `linux-sm8750-piano@<commit>` |
+| `initramfs.cpio.gz` | `tools/build-initramfs.sh` 需 `BUSYBOX` + `GEN_INIT_CPIO`，须本机构建 |
+| `root.ext4` / `root.sparse.img` | `tools/build-rootfs-image.py` 需 sudo、apt 快照、专用 `mke2fs` + qemu-user-static |
+| `SunUEFI-Piano-*.zip` | 需 `git subtree` 引入 SunUEFI 引导层并 ARM64 交叉编译 Android 助手模块 |
+| 原厂 DTB overlay / 合体 BOOT / UEFI FD | **只能从你的设备提取**；Android 17 的 BOOT 头须先 `piano-boot-repack probe`（G3） |
+
+### 出真镜像的操作
+
+`full_build=true` 时由 `port/build/port-full-build.sh` 做真实接线（不再是旧版的
+echo 示例 + `|| true`）：从 `kernel/source.json` 读固定 commit → clone/校验内核源码 →
+检查交叉工具链 → 跑 `tools/build-kernel.sh` → 生成 4K 对齐 FAT32 `esp.raw` →
+写 `port-inputs.env`，workflow 再把 `--inputs/--esp-image/--root-image/--module-zip`
+全量传给 `port-build.sh`。**任何前置条件缺失都直接失败并给出指引，绝不静默产出占位。**
+
+1. 把你本机/自建 runner 构建好的产物放进 `port/inputs/`（默认目录，可用
+   `external_inputs_dir` 输入改）：
+   ```
+   initramfs.cpio.gz · root.ext4（或 root.sparse.img / root.image）
+   SunUEFI-Piano-*.zip
+   stock-base.dtb · stock-overlay.dtbo · ufdt   （可选，用于合并原厂 DTB）
+   ```
+   大镜像建议用 Git LFS、release asset 或自建 runner 预置，不要直接提交进 git。
+2. Actions → `SunUEFI build products` → 勾 `full_build=true`（可填 `external_inputs_dir`）→ 运行。
+3. 检查 `port-inputs-manifest.json` 的 `status`：
+   - `READY` = 三产物都有真实镜像；
+   - `PARTIAL_EXTERNAL_INPUTS` = 仍有输入缺失，对应产物仍是占位。
+4. 产物 ZIP 里应出现 `esp.sparse.img` / `root-<target>.sparse.img` / `SunUEFI-Piano-*.zip`，
+   而不再是 `README.txt`。此时 `manifest.json` 的 `status` 才是 `RELEASE_ASSETS_READY`。
+
+### ⚠️ 账号注入的形态限制（需求 5）
+
+`piano/piano` + root=`piano` 由 `port-inject-login.py` 对一个**解出的 rootfs 目录**后处理。
+若你提供的是**已打包的 `root.ext4` 镜像**（`--root-image`），port 层无法再往镜像里写
+`/etc/shadow`，构建时会打印明确警告。两条路二选一：
+
+- **推荐**：本机构建 rootfs 时，先对目录跑
+  `python3 port/tools/port-inject-login.py --rootfs <目录> --profile port/config/port-profile.json`
+  和 `port-adapt-rootfs.py`，再用上游 `build-ubuntu-ext4.py` 打包成镜像；
+- 或提供 `--inputs/rootfs` 目录形态（此时 `port-build.sh` 会执行注入），但这需要你自行
+  完成后续的 ext4 镜像化（`mke2fs -d`，需 root 权限）。
+
+**只给 `root.ext4` 而不预先注入账号 → 镜像里不会有 piano 账号**，`port-build.sh` 的
+日志会提醒你。这是镜像形态的固有限制，不是脚本 bug。
+
+即便拿到真镜像，**刷入仍不是单文件线刷**：需要新建 `sunuefi_esp`/`sunuefi_root`、
+刷两个 sparse、安装 Android 助手模块、写 BootRequest 切换，首次先 `fastboot boot`
+内存试运行；G3 合体 BOOT 未闭环前不能上真机。
+
+## 10. 发布门禁（占位骨架不得冒充正式版）
+
+`port/config/release-policy.json` 的 `placeholder_guard` 默认开启。
+`port-release-assets.py` 在检测到占位产物时，除 ZIP/校验和/说明外还会生成
+`release-flags.env`（**CI 中间文件，不上传、不计入 `SHA256SUMS`**）：
+
+```
+FORCE_DRAFT=1
+FORCE_PRERELEASE=1
+GUARD_STATUS=GUARD_TRIGGERED
+GUARD_MESSAGE='检测到占位产物…'
+```
+
+两个 publish job（`sunuefi-build.yml` 的 `publish`、`sunuefi-release.yml`）都会
+source 该文件，把 Release 强制创建/编辑为**草稿 + 预发布**，并在 Step Summary 打警告：
+
+| 场景 | 结果 |
+|---|---|
+| 占位产物，默认 | `gh release create ... --draft --prerelease`；已存在则 `gh release edit --draft --prerelease` |
+| 占位产物，手动勾 `allow_placeholder_release=true` | 跳过降级，按你选的 draft/prerelease 设置发布 |
+| 真实产物（`RELEASE_ASSETS_READY`） | `GUARD_CLEAR`，flags 全 0，正常发布 |
+
+`manifest.json` 与 `--json` 摘要里都有 `publish_guard` 字段，`RELEASE-NOTES.md`
+会写明"发布门禁已生效"。**下载 Release 后先看 `manifest.json` 的 `status`**：
+`RELEASE_ASSETS_CONTAINS_PLACEHOLDERS` 就说明只是 CI 骨架，不能刷机。

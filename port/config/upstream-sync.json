@@ -36,7 +36,8 @@
       "port/tools/port-switch.sh",
       "port/tools/port-release-assets.py",
       "port/config/release-policy.json",
-      "port/build/port-build.sh"
+      "port/build/port-build.sh",
+      "port/build/port-full-build.sh"
     ]
   },
   "sync_steps": [
@@ -45,7 +46,8 @@
     "git merge --no-edit upstream/main（仅改上游受管目录）",
     "port/tools/port-check-isolation.py 校验：无上游文件被本 fork 修改、port/ 完整",
     "port/tools/verify-port.sh 自检",
-    "触发 .github/workflows/sunuefi-build.yml 重新构建三产物",
+    "触发 .github/workflows/sunuefi-build.yml 重新构建三产物（FULL_BUILD=true 时由 port/build/port-full-build.sh 真实编译）",
+    "发布门禁：port-release-assets.py 检测占位产物并输出 release-flags.env，publish job 强制草稿+预发布",
     "可选：打 v* tag 触发 publish job 把三产物发布到 GitHub Release（需求 7）；或手动跑 sunuefi-release.yml 补发"
   ],
   "conflict_policy": "若上游某天新增了 port/ 或同名 sunuefi-*.yml（极低概率），同步脚本会中止并报告，需人工把本 fork 对应内容改名/合并；绝不自动覆盖。"

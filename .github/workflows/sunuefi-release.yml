@@ -6,6 +6,7 @@ name: SunUEFI publish release
 #   * 构建跑绿了，但 publish job 因权限/网络失败，需要重发；
 #   * 想把某次历史构建单独发布成一个正式版本；
 #   * 同一 tag 换了资产，需要 --clobber 覆盖。
+# 发布门禁同样生效：若该历史 run 的产物是占位骨架，强制草稿 + 预发布。
 # 该 workflow 只写 GitHub Release，不改仓库文件、不碰设备。
 on:
   workflow_dispatch:
@@ -24,6 +25,10 @@ on:
         default: false
       prerelease:
         description: '标记为预发布'
+        type: boolean
+        default: false
+      allow_placeholder_release:
+        description: '显式允许把占位骨架产物补发为正式版（默认 false：占位时强制草稿+预发布）'
         type: boolean
         default: false
 
@@ -84,7 +89,45 @@ jobs:
             --commit "${{ github.sha }}" \
             --json | tee release-summary.json
 
+      - name: 应用发布门禁（占位骨架不得作为正式版）
+        id: guard
+        env:
+          ALLOW_PLACEHOLDER: ${{ inputs.allow_placeholder_release }}
+        run: |
+          set -euo pipefail
+          DRAFT="$WANT_DRAFT"
+          PRE="$WANT_PRERELEASE"
+          GSTATUS="GUARD_DISABLED"
+          GMESSAGE=""
+          if [ -f release-assets/release-flags.env ]; then
+            # shellcheck disable=SC1091
+            source release-assets/release-flags.env
+            GSTATUS="${GUARD_STATUS:-GUARD_DISABLED}"
+            GMESSAGE="${GUARD_MESSAGE:-}"
+            if [ "${FORCE_DRAFT:-0}" = "1" ] && [ "$ALLOW_PLACEHOLDER" != "true" ]; then
+              DRAFT=1
+              PRE=1
+              echo "::warning::发布门禁：该历史构建的产物是占位骨架，强制草稿 + 预发布"
+            elif [ "${FORCE_DRAFT:-0}" = "1" ]; then
+              echo "::warning::已显式勾选 allow_placeholder_release，跳过门禁降级"
+            fi
+          fi
+          echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "status=$GSTATUS" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 发布门禁"
+            echo "- 状态: \`$GSTATUS\`"
+            echo "- 最终草稿: \`$DRAFT\` / 预发布: \`$PRE\`"
+            if [ -n "$GMESSAGE" ]; then
+              echo "- 说明: $GMESSAGE"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 发布到 GitHub Release
+        env:
+          DRAFT: ${{ steps.guard.outputs.draft }}
+          PRE: ${{ steps.guard.outputs.prerelease }}
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag }}"
@@ -94,19 +137,26 @@ jobs:
           echo "待上传 ${#FILES[@]} 个文件: ${FILES[*]}"
           if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             gh release edit "$TAG" --repo "$GH_REPO" --notes-file RELEASE-NOTES.md
+            if [ "$DRAFT" = "1" ]; then
+              gh release edit "$TAG" --repo "$GH_REPO" --draft --prerelease
+            fi
             gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GH_REPO"
           else
             ARGS=(create "$TAG" "${FILES[@]}" --repo "$GH_REPO" \
                   --title "$TITLE" --notes-file RELEASE-NOTES.md)
-            [ "$WANT_DRAFT" = "1" ] && ARGS+=(--draft)
-            [ "$WANT_PRERELEASE" = "1" ] && ARGS+=(--prerelease)
+            [ "$DRAFT" = "1" ] && ARGS+=(--draft)
+            [ "$PRE" = "1" ] && ARGS+=(--prerelease)
             gh release "${ARGS[@]}"
           fi
           gh release view "$TAG" --repo "$GH_REPO" --json url,tagName,isDraft,isPrerelease
 
       - name: 汇总
+        env:
+          GUARD_STATUS: ${{ steps.guard.outputs.status }}
+          DRAFT: ${{ steps.guard.outputs.draft }}
         run: |
           echo "### Release 补发结果" >> "$GITHUB_STEP_SUMMARY"
           echo "- Tag: \`${{ inputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- 来源构建 run: \`${{ steps.dl.outputs.run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 发布门禁: \`$GUARD_STATUS\`（草稿=$DRAFT）" >> "$GITHUB_STEP_SUMMARY"
           echo "- 链接: https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag }}" >> "$GITHUB_STEP_SUMMARY"

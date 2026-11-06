@@ -1,0 +1,5 @@
+# FULL_BUILD 的本机/设备专属输入（initramfs.cpio.gz / root.ext4 / SunUEFI-Piano-*.zip / 原厂 DTB）
+# 体积大且可能含设备序列号等标识，不提交进 git。
+# 用 Git LFS、Release asset 或自建 runner 预置；构建时由 --external-inputs 指向。
+*
+!.gitignore

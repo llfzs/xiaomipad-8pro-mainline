@@ -1,6 +1,6 @@
 {
-  "schema": 1,
-  "description": "需求 7：把 sunuefi-build.yml 构建出的三产物发布到 GitHub Release 的策略。本配置与发布脚本、workflow 全部位于 port/ 与 .github/workflows/sunuefi-* 自有命名空间，遵循需求 3 的 patchless 只增不改。",
+  "schema": 2,
+  "description": "需求 7：把 sunuefi-build.yml 构建出的三产物发布到 GitHub Release 的策略。本配置与发布脚本、workflow 全部位于 port/ 与 .github/workflows/sunuefi-* 自有命名空间，遵循需求 3 的 patchless 只增不改。schema 2 新增 placeholder_guard 发布门禁。",
   "tag_prefix": "v",
   "tag_trigger_glob": "v*",
   "auto_tag_template": "port-{short_sha}",
@@ -9,6 +9,14 @@
   "prerelease": false,
   "clobber": true,
   "clobber_note": "同一 tag 重跑时覆盖同名 asset，避免 CI 重跑失败；release 已存在则走 gh release upload。",
+  "placeholder_guard": {
+    "enabled": true,
+    "on_placeholder": "draft_prerelease",
+    "allow_override_input": "allow_placeholder_release",
+    "flags_file": "release-flags.env",
+    "message": "检测到占位产物（目录里只有 README.txt，不是可刷镜像）。本次发布强制降级为草稿 + 预发布；如需正式发布，请先完成 FULL_BUILD 真实编译产出真镜像，或在手动发布时显式勾选 allow_placeholder_release。",
+    "note": "门禁由 port-release-assets.py 在生成资产时判定，输出 release-flags.env；两个 publish job source 该文件后覆盖 --draft/--prerelease。flags 文件只是 CI 中间产物，不进 upload-files.txt 与 SHA256SUMS。"
+  },
   "upload_files": [
     "SunUEFI-Module.zip",
     "SunUEFI-ESP.zip",

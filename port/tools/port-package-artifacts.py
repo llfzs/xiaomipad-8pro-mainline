@@ -208,6 +208,7 @@ def main() -> int:
     artifacts["artifacts"]["SunUEFI-ESP"] = esp_entry
 
     # ---- 3. SunUEFI-Root-<target>（每发行版）----
+    root_status = "PLACEHOLDER_NEEDS_ROOTFS_BUILD"
     for d in selected:
         root_dir = out / d["artifact"]
         root_dir.mkdir(parents=True, exist_ok=True)
@@ -244,7 +245,14 @@ def main() -> int:
 
     (out / "manifest.json").write_text(json.dumps(artifacts, indent=2) + "\n")
     print(json.dumps(artifacts, indent=2))
-    print("\n[OK] 三产物骨架已生成（仅文件，未刷写任何设备）。", file=sys.stderr)
+    statuses = (module_status, esp_status, root_status)
+    ph = [s for s in statuses if s.startswith("PLACEHOLDER")]
+    if ph:
+        print("\n[OK] 三产物骨架已生成（仅文件，未刷写任何设备）。", file=sys.stderr)
+        print(f"[warn] {len(ph)} 项仍为占位骨架；发布门禁将强制草稿 + 预发布。",
+              file=sys.stderr)
+    else:
+        print("\n[OK] 三产物真实镜像已生成（仅文件，未刷写任何设备）。", file=sys.stderr)
     return 0
 
 

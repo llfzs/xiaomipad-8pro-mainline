@@ -76,7 +76,12 @@ if [ -n "$INPUTS" ] && [ -d "$INPUTS/rootfs" ]; then
   # 本脚本只产出处理好的目录，镜像化由 CI 的 rootfs job 完成（见 workflow）。
   echo "  处理后的 rootfs 目录: $WORK/rootfs（本脚本不镜像化，交由 rootfs job）"
 else
-  warn "[1/5] 未提供解出的 rootfs 目录，跳过账号/挂载后处理（CI 应传入 --inputs/rootfs 或预打包的 --root-image）"
+  warn "[1/5] 未提供解出的 rootfs 目录，跳过账号/挂载后处理"
+  if [ -n "$ROOT_IMAGE" ] && [ -f "$ROOT_IMAGE" ]; then
+    warn "      --root-image 是已打包镜像，port 层无法再注入 piano/piano 账号。"
+    warn "      请确保该镜像在本机构建时已预置账号与 sunuefi_root 挂载契约"
+    warn "      （见 port/docs/RELEASE.md 第 9 节），或改提供 --inputs/rootfs 目录形态。"
+  fi
 fi
 
 # 2) ESP 布局：内核四件套 -> SUNUEFI-LINUXv2

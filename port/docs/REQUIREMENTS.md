@@ -13,6 +13,8 @@
 | 5 | 账号 `piano`/`piano`、root=`piano` | `config/port-profile.json` 的 `login`；`port-inject-login.py` 在 rootfs 后处理注入 `/etc/passwd|shadow|group|gshadow` 的 sha512-crypt 哈希 + GDM 自动登录 + sudoers；**不改上游** `build-rootfs-image.py` 的"无账号/root 锁定"校验逻辑（只在其校验之后对产物注入） | selftest 用 `crypt`/`openssl` 反算哈希验证三个密码，并验证幂等 |
 | 6 | 新增 GitHub Actions、在 GitHub 上构建 | `.github/workflows/sunuefi-build.yml`（push/repository_dispatch/manual，`ubuntu-24.04-arm`，matrix，三 `upload-artifact` 命名严格对齐 SunUEFI）；`sunuefi-sync-upstream.yml`（schedule + dispatch） | verify 校验 YAML 可被解析、`on/jobs/steps` 结构、三 artifact 名存在 |
 | 7 | **构建产物推到 Release** | `sunuefi-build.yml` 新增 `publish` job（push `v*` tag 或 dispatch 勾 `publish_release` 触发，job 级 `contents: write`，`download-artifact` → `gh release create/upload --clobber`）；`sunuefi-release.yml` 手动补发（`gh run download` 复用已有成功 run，不重新编译）；`port/tools/port-release-assets.py` 把三产物目录压成同名 ZIP（规避各目录 `SHA256SUMS` 重名覆盖）并生成全局 `SHA256SUMS` + `manifest.json` + `RELEASE-NOTES.md` + `upload-files.txt`；`config/release-policy.json` 定义 tag/draft/prerelease/上传清单；`docs/RELEASE.md` 为操作手册 | verify 断言 `publish` job、`contents: write`、`tags:`、`gh release`；selftest 端到端生成 Release 资产并校验 ZIP 内容、全局 SHA256、manifest、Notes、缺 ESP 负例 |
+| 补强 A | **真实编译接线**（替换旧 echo 占位） | `port/build/port-full-build.sh`：从 `kernel/source.json` 读固定 commit，clone/校验内核源码、检查交叉工具链、跑 `tools/build-kernel.sh`、生成 4K 对齐 FAT32 `esp.raw`、写 `port-inputs.env`；workflow 把 `--inputs/--esp-image/--root-image/--module-zip` 全量传给 `port-build.sh`，并去掉 `|| true` 掩盖 | verify 断言无「示例接线」残留、四个传参齐全、无 `tee ... \|\| true`；selftest 跑 `--dry-run` 校验元数据/源码/输出契约 |
+| 补强 B | **发布门禁** | `release-policy.json#placeholder_guard` + `port-release-assets.py` 输出 `release-flags.env`；两个 publish job source 后把占位骨架强制降级为草稿 + 预发布，`allow_placeholder_release` 可显式放行 | verify 断言两个 workflow 都有门禁要素；selftest 覆盖 `GUARD_CLEAR` / `GUARD_TRIGGERED` 与 flags、Notes、上传清单隔离 |
 
 ## 三个必须记住的架构决定
 
@@ -53,11 +55,14 @@
 
 ## 诚实边界
 
-本工程包在 GitHub Actions 上**一定能跑绿**的是：隔离校验、离线自检、三产物骨架打包
-（含占位说明）、artifact 上传，以及需求 7 的 Release 发布（tag/dispatch 触发 publish job，
-产出 ZIP + 校验和 + 说明；占位状态会在 `RELEASE-NOTES.md` 里显式警告"不可刷机"）。
-**完整内核/rootfs 编译**（`FULL_BUILD=true`）依赖上游
-内核源码子模块、Ubuntu apt 快照、专用 `mke2fs`、以及**必须取自你本机的设备专属固件**，
-首次建议在 `ubuntu-24.04-arm` 或自建 ARM64 runner 上跑通后再开启。占位产物目录里的
-`README.txt` 明确写了"真实镜像从哪来、怎么替换"。真机刷写验证清单见
-`PORTING-MAP.md` 第 6 节。
+默认（`full_build=false`）在 GitHub Actions 上**一定能跑绿**的是：隔离校验、离线自检、
+三产物骨架打包（含占位说明）、artifact 上传，以及需求 7 的 Release 发布（占位时被
+**发布门禁强制降级为草稿 + 预发布**）。**这些产物不是可刷镜像**——`manifest.json`
+写 `RELEASE_ASSETS_CONTAINS_PLACEHOLDERS`，`RELEASE-NOTES.md` 明确警告"不可刷机"。
+
+`full_build=true` 走 `port/build/port-full-build.sh` 的真实编译接线，但仍需你提供
+公共 runner 拿不到的输入：本机构建的 `initramfs.cpio.gz`、`root.ext4`、
+`SunUEFI-Piano-*.zip`、原厂 DTB / 合体 BOOT / UEFI FD（后三者只能取自你的设备），
+以及 rootfs 构建所需的 sudo + apt 快照 + 专用 `mke2fs`。缺任一输入都会**明确失败**，
+不再静默产出占位。首次建议在 `ubuntu-24.04-arm` 或自建 ARM64 runner 上跑通，
+详见 `RELEASE.md` 第 9 节。真机刷写验证清单见 `PORTING-MAP.md` 第 6 节。

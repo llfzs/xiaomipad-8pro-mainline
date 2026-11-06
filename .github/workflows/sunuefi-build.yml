@@ -5,6 +5,7 @@ name: SunUEFI build products
 #   * push tag v*        -> 构建完成后自动发布到该 tag
 #   * workflow_dispatch  -> 勾 publish_release 手动发布（可不打 tag，自动生成 port-<sha>）
 #   * 另有 sunuefi-release.yml 用于「不重新编译、从已有 run 补发/重发」。
+# 发布门禁：占位骨架产物（只有 README.txt）强制降级为草稿+预发布，不冒充正式版。
 # 需求 3：UEFI 全部位于 port/ 与 .github/workflows/sunuefi-*，零上游文件修改，
 #         同步上游 merge 后 push 到 main 会触发本构建；tag push 不评估 paths 过滤。
 on:
@@ -33,9 +34,13 @@ on:
         options: [all, ubuntu-gnome, debian-gnome, debian-kde, nyarch-gnome, steamos]
         default: all
       full_build:
-        description: '是否调用上游脚本做完整内核/rootfs 编译（需 ARM64 runner 与设备固件；否则只跑 port 层）'
+        description: '真实编译：调用 port/build/port-full-build.sh 编译内核并产出 ESP 镜像（需 ARM64 runner + 外部输入目录；缺输入会直接失败）'
         type: boolean
         default: false
+      external_inputs_dir:
+        description: '外部输入目录（initramfs.cpio.gz / root.ext4 / SunUEFI-Piano-*.zip / 原厂 DTB），相对仓库根'
+        type: string
+        default: 'port/inputs'
       publish_release:
         description: '构建完成后把三产物发布到 GitHub Release（需求 7）'
         type: boolean
@@ -50,6 +55,10 @@ on:
         default: false
       prerelease:
         description: '标记为预发布（仅手动发布时生效）'
+        type: boolean
+        default: false
+      allow_placeholder_release:
+        description: '显式允许把占位骨架产物发布为正式版（默认 false：占位时强制草稿+预发布）'
         type: boolean
         default: false
 
@@ -105,6 +114,7 @@ jobs:
     env:
       SUNUEFI_TARGET: ${{ matrix.target }}
       FULL_BUILD: ${{ inputs.full_build && '1' || '0' }}
+      PORT_INPUTS: ${{ runner.temp }}/port-inputs
     steps:
       - uses: actions/checkout@v4
         with:
@@ -117,33 +127,55 @@ jobs:
           python3 --version
           bash port/verify-port.sh . >/dev/null && echo "port 层自检通过"
 
-      # ---- Stage B（可选）：调用上游真实脚本产出内核四件套 + rootfs ----
-      # 依赖：linux-sm8750-piano 内核源码、Ubuntu apt snapshot、专用 e2fsprogs、
-      #       设备专属固件。首次建议在 self-hosted ARM64 runner 上跑通后再开启。
-      - name: '[可选] 上游完整编译（内核 + rootfs）'
+      # ---- Stage B（FULL_BUILD=true）：真实编译接线，失败即 job 失败 ----
+      # 旧版这里是 "echo 示例 + || true"，跑绿但不产出任何镜像；现已换成
+      # port/build/port-full-build.sh：真实 clone/校验内核源码、跑 build-kernel.sh、
+      # 生成 FAT32 ESP raw 镜像，并写 port-inputs.env 给下一步消费。
+      # 设备/发行版专属产物（initramfs / root 镜像 / Module ZIP / 原厂 DTB）
+      # 由 --external-inputs 目录提供；缺失会明确报错，绝不静默产出占位。
+      - name: '[FULL_BUILD] 上游真实编译接线（内核 + ESP 镜像）'
+        id: fullbuild
         if: env.FULL_BUILD == '1'
+        env:
+          EXTERNAL_DIR: ${{ inputs.external_inputs_dir || 'port/inputs' }}
         run: |
           set -euo pipefail
-          echo "调用源仓库构建链（示例接线，按上游当前脚本调整，见 port/docs/PORTING-MAP.md 第 4 节）"
-          bash tools/build-kernel.sh || echo "::warning::上游内核构建需要内核源码子模块"
-          python3 tools/prepare-boot-dtb.py || true
-          bash tools/build-initramfs.sh || true
-          mkdir -p build/port-inputs
-          echo "rootfs 编译需 root+qemu-user-static+专用 mke2fs，参考 ubuntu/root-image.json"
-          echo "::notice::完整编译产物应软链/复制到 build/port-inputs 供后续 port-build.sh 消费"
+          mkdir -p "$PORT_INPUTS"
+          ARGS=(--fork "$PWD" --inputs "$PORT_INPUTS" --esp-size-mib 512)
+          [ -n "$EXTERNAL_DIR" ] && ARGS+=(--external-inputs "$PWD/$EXTERNAL_DIR")
+          bash port/build/port-full-build.sh "${ARGS[@]}"
+          # 导出真实产物路径给「组装三产物」步骤
+          # shellcheck disable=SC1090
+          source "$PORT_INPUTS/port-inputs.env"
+          echo "inputs=$INPUTS_DIR" >> "$GITHUB_OUTPUT"
+          echo "esp=${ESP_IMAGE:-}" >> "$GITHUB_OUTPUT"
+          echo "root=${ROOT_IMAGE:-}" >> "$GITHUB_OUTPUT"
+          echo "module=${MODULE_ZIP:-}" >> "$GITHUB_OUTPUT"
+          echo "status=${FULL_BUILD_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "::notice::FULL_BUILD 状态: ${FULL_BUILD_STATUS:-UNKNOWN}（见 port-inputs-manifest.json）"
 
-      # ---- Stage A（默认，GitHub 上必跑通）：port 层后处理 + 三产物打包 ----
+      # ---- Stage A：port 层后处理 + 三产物打包 ----
+      # FULL_BUILD 开启时把 --inputs / --esp-image / --root-image / --module-zip
+      # 全部传给 port-build.sh，使其产出真实 sparse 镜像而非占位骨架。
+      # 去掉旧版的 "|| true"：打包失败则 job 失败，不再静默成功。
       - name: 组装三产物（账号/挂载/ESP/打包）
         env:
-          MODULE_ZIP: ${{ inputs.full_build && 'artifacts/android/SunUEFI-Piano.zip' || '' }}
+          FB_INPUTS: ${{ steps.fullbuild.outputs.inputs }}
+          FB_ESP: ${{ steps.fullbuild.outputs.esp }}
+          FB_ROOT: ${{ steps.fullbuild.outputs.root }}
+          FB_MODULE: ${{ steps.fullbuild.outputs.module }}
+          LEGACY_MODULE: ${{ inputs.full_build && 'artifacts/android/SunUEFI-Piano.zip' || '' }}
         run: |
+          set -euo pipefail
           mkdir -p artifacts/downloads
-          bash port/build/port-build.sh \
-            --fork "$PWD" \
-            --output "$PWD/artifacts/downloads/build" \
-            --target "$SUNUEFI_TARGET" \
-            --module-zip "$MODULE_ZIP" \
-            2>&1 | tee build-port.log || true
+          PKG=(--fork "$PWD" --output "$PWD/artifacts/downloads/build" --target "$SUNUEFI_TARGET")
+          [ -n "$FB_INPUTS" ] && [ -d "$FB_INPUTS" ] && PKG+=(--inputs "$FB_INPUTS")
+          M="${FB_MODULE:-$LEGACY_MODULE}"
+          [ -n "$M" ] && [ -f "$M" ] && PKG+=(--module-zip "$M")
+          [ -n "$FB_ESP" ] && [ -f "$FB_ESP" ] && PKG+=(--esp-image "$FB_ESP")
+          [ -n "$FB_ROOT" ] && [ -f "$FB_ROOT" ] && PKG+=(--root-image "$FB_ROOT")
+          echo "port-build.sh 参数: ${PKG[*]}"
+          bash port/build/port-build.sh "${PKG[@]}" 2>&1 | tee build-port.log
           test -f artifacts/downloads/build/manifest.json
 
       # ---- 归置为三个 upload-artifact 目录（严格对齐 SunUEFI 命名）----
@@ -244,7 +276,45 @@ jobs:
             --upstream-baseline "yzddmr6/xiaomipad-8pro-mainline@main" \
             --json | tee release-summary.json
 
+      - name: 应用发布门禁（占位骨架不得作为正式版）
+        id: guard
+        env:
+          ALLOW_PLACEHOLDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_placeholder_release || false }}
+        run: |
+          set -euo pipefail
+          DRAFT="$WANT_DRAFT"
+          PRE="$WANT_PRERELEASE"
+          GSTATUS="GUARD_DISABLED"
+          GMESSAGE=""
+          if [ -f release-assets/release-flags.env ]; then
+            # shellcheck disable=SC1091
+            source release-assets/release-flags.env
+            GSTATUS="${GUARD_STATUS:-GUARD_DISABLED}"
+            GMESSAGE="${GUARD_MESSAGE:-}"
+            if [ "${FORCE_DRAFT:-0}" = "1" ] && [ "$ALLOW_PLACEHOLDER" != "true" ]; then
+              DRAFT=1
+              PRE=1
+              echo "::warning::发布门禁：检测到占位骨架产物，强制草稿 + 预发布（不是可刷固件）"
+            elif [ "${FORCE_DRAFT:-0}" = "1" ]; then
+              echo "::warning::已显式勾选 allow_placeholder_release，跳过门禁降级"
+            fi
+          fi
+          echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "status=$GSTATUS" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 发布门禁"
+            echo "- 状态: \`$GSTATUS\`"
+            echo "- 最终草稿: \`$DRAFT\` / 预发布: \`$PRE\`"
+            if [ -n "$GMESSAGE" ]; then
+              echo "- 说明: $GMESSAGE"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 发布到 GitHub Release
+        env:
+          DRAFT: ${{ steps.guard.outputs.draft }}
+          PRE: ${{ steps.guard.outputs.prerelease }}
         run: |
           set -euo pipefail
           TAG="${{ steps.assets.outputs.tag }}"
@@ -255,21 +325,28 @@ jobs:
           if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             echo "Release 已存在：更新说明并覆盖同名 asset"
             gh release edit "$TAG" --repo "$GH_REPO" --notes-file RELEASE-NOTES.md
+            if [ "$DRAFT" = "1" ]; then
+              gh release edit "$TAG" --repo "$GH_REPO" --draft --prerelease
+            fi
             gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GH_REPO"
           else
             ARGS=(create "$TAG" "${FILES[@]}" --repo "$GH_REPO" \
                   --title "$TITLE" --notes-file RELEASE-NOTES.md)
-            [ "$WANT_DRAFT" = "1" ] && ARGS+=(--draft)
-            [ "$WANT_PRERELEASE" = "1" ] && ARGS+=(--prerelease)
+            [ "$DRAFT" = "1" ] && ARGS+=(--draft)
+            [ "$PRE" = "1" ] && ARGS+=(--prerelease)
             gh release "${ARGS[@]}"
           fi
           gh release view "$TAG" --repo "$GH_REPO" --json url,tagName,isDraft,isPrerelease
 
       - name: 汇总
+        env:
+          GUARD_STATUS: ${{ steps.guard.outputs.status }}
+          DRAFT: ${{ steps.guard.outputs.draft }}
         run: |
           TAG="${{ steps.assets.outputs.tag }}"
           echo "### Release 发布结果" >> "$GITHUB_STEP_SUMMARY"
           echo "- Tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- 链接: https://github.com/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
           echo "- 触发: \`${{ github.event_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 发布门禁: \`$GUARD_STATUS\`（草稿=$DRAFT）" >> "$GITHUB_STEP_SUMMARY"
           echo "- 资产: SunUEFI-Module.zip / SunUEFI-ESP.zip / SunUEFI-Root-*.zip / manifest.json / SHA256SUMS / RELEASE-NOTES.md" >> "$GITHUB_STEP_SUMMARY"

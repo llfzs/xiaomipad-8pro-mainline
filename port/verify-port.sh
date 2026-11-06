@@ -36,11 +36,11 @@ for f in \
   tools/port-stage-esp.py tools/port-adapt-rootfs.py tools/port-partition-plan.py \
   tools/port-inject-login.py tools/port-package-artifacts.py tools/port-release-assets.py \
   tools/port-check-isolation.py tools/port-sync-upstream.sh tools/port-switch.sh \
-  build/port-build.sh \
+  build/port-build.sh build/port-full-build.sh \
   docs/PORTING-MAP.md docs/REQUIREMENTS.md docs/SYNC-UPSTREAM.md docs/RELEASE.md; do
   [ -f "$PORTROOT/$f" ] || fail "缺文件 port/$f"
 done
-pass "port/ 关键文件齐全（含需求 3/4/5/7 新增脚本与文档）"
+pass "port/ 关键文件齐全（含需求 3/4/5/7 脚本、真实编译接线器与文档）"
 
 echo "=== 2. Python / Shell 语法 ==="
 python3 - "$PORTROOT" <<'PY' || fail "python 语法错误"
@@ -90,8 +90,15 @@ assert rel['clobber'] is True
 assert 'SunUEFI-Module.zip' in rel['upload_files']
 assert any(x.startswith('SunUEFI-Root-') for x in rel['upload_files'])
 assert len(rel['required_artifacts']) == 3
+# 需求 7 补强：发布门禁
+guard = rel['placeholder_guard']
+assert guard['enabled'] is True
+assert guard['on_placeholder'] == 'draft_prerelease'
+assert guard['allow_override_input'] == 'allow_placeholder_release'
+assert guard['flags_file'] == 'release-flags.env'
 assert 'port/tools/port-release-assets.py' in sync['isolation_rules']['protected_port_files']
-print('  profile/distros/sync/release-policy 需求字段 OK')
+assert 'port/build/port-full-build.sh' in sync['isolation_rules']['protected_port_files']
+print('  profile/distros/sync/release-policy 需求字段 OK（含发布门禁 + 真实编译接线器登记）')
 PY
 pass "配置合法（分区/账号/产物/同步/发布字段）"
 
@@ -127,18 +134,34 @@ assert 'sunuefi-release.yml' in names, '缺手动补发 workflow'
 for token in ('tags:', 'v*', 'publish_release:', 'publish:', 'port-release-assets.py',
               'pattern: SunUEFI-*', 'gh release', '--clobber', 'contents: write'):
     assert token in build_text, f"构建 workflow 缺需求 7 要素: {token}"
+# 真实编译接线：不再允许 echo 占位 / 静默 || true
+assert '示例接线' not in build_text, '仍残留「示例接线」echo 占位'
+assert '应软链/复制到 build/port-inputs' not in build_text, '仍残留旧占位提示'
+for token in ('port/build/port-full-build.sh', '--external-inputs',
+              '--inputs "$FB_INPUTS"', '--esp-image', '--root-image', '--module-zip',
+              'port-inputs.env', 'FULL_BUILD'):
+    assert token in build_text, f"构建 workflow 缺真实接线要素: {token}"
+assert 'tee build-port.log || true' not in build_text, '组装步骤仍用 || true 掩盖失败'
+# 发布门禁：两个 workflow 都必须有
+for token in ('allow_placeholder_release', 'release-flags.env', 'FORCE_DRAFT',
+              '应用发布门禁', 'GUARD_STATUS'):
+    assert token in build_text, f"构建 workflow 缺发布门禁要素: {token}"
 if yaml:
     bd = yaml.safe_load(build_text)
     assert 'publish' in bd['jobs'], 'publish job 解析失败'
     assert bd['jobs']['publish']['permissions']['contents'] == 'write'
     assert bd['jobs']['publish']['needs'] == ['select', 'build']
-# 手动补发 workflow：复用已有 run、不重新编译
+    psteps = [s.get('name') for s in bd['jobs']['publish']['steps']]
+    assert '应用发布门禁（占位骨架不得作为正式版）' in psteps
+# 手动补发 workflow：复用已有 run、不重新编译，同样带门禁
 rel_text = (wf/'sunuefi-release.yml').read_text()
-for token in ('workflow_dispatch:', 'gh run download', 'port-release-assets.py'):
+for token in ('workflow_dispatch:', 'gh run download', 'port-release-assets.py',
+              'allow_placeholder_release', 'release-flags.env', 'FORCE_DRAFT',
+              '应用发布门禁'):
     assert token in rel_text, f"补发 workflow 缺 {token}"
 # 同步 workflow：可选同步后打发布 tag
 assert 'release_tag_after_sync' in (wf/'sunuefi-sync-upstream.yml').read_text()
-print(f'  {len(files)} 个 workflow：三产物 + publish/补发/同步打 tag 校验通过')
+print(f'  {len(files)} 个 workflow：三产物 + 真实编译接线 + 发布门禁校验通过')
 PY
   pass "Actions YAML（三产物命名 + 需求 7 发布链路）"
 else

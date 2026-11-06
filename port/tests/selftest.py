@@ -9,7 +9,9 @@
   - port-inject-login.py：piano/piano + root piano（crypt 反算）+ 幂等 + 自动登录  [需求5]
   - port-package-artifacts.py：三产物目录 + Android sparse magic/chunk + sha256  [需求4]
   - port-release-assets.py：三产物→同名 ZIP + 全局 SHA256 + manifest + Notes + 缺产物负例  [需求7]
+  - 发布门禁：真实产物 GUARD_CLEAR / 占位 GUARD_TRIGGERED + release-flags.env  [需求7 补强]
   - port-check-isolation.py：正例通过、上游改动触及命名空间负例被拦截  [需求3]
+  - port-full-build.sh --dry-run：上游元数据/内核 commit/fragments/输出契约  [真实编译接线]
 
 参数：套件根 KIT（含 overlay/port/... 或已 apply 后含 port/...）。
 """
@@ -68,10 +70,10 @@ def make_synthetic_inputs(d: Path):
 def verify_password(hashed: str, password: str) -> bool:
     """用 crypt 或 openssl 反算校验 sha512-crypt 哈希。"""
     import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        import crypt as _crypt
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            import crypt as _crypt
         return _crypt.crypt(password, hashed) == hashed
     except (ImportError, AttributeError):
         r = subprocess.run(["openssl", "passwd", "-6", "-salt",
@@ -267,7 +269,37 @@ def main() -> int:
             capture_output=True, text=True)
         assert r3.returncode != 0 and "缺少必需产物" in (r3.stdout + r3.stderr), \
             "缺 ESP 时未拒绝发布"
+        # 发布门禁：本段用的是真实合成镜像 -> GUARD_CLEAR，flags 全 0
+        flags_path = rel_out / "release-flags.env"
+        assert flags_path.is_file(), "缺 release-flags.env"
+        flags = dict(line.split("=", 1) for line in flags_path.read_text().splitlines()
+                     if "=" in line)
+        assert flags["FORCE_DRAFT"] == "0" and flags["FORCE_PRERELEASE"] == "0"
+        assert flags["GUARD_STATUS"] == "GUARD_CLEAR"
+        assert rm["publish_guard"]["status"] == "GUARD_CLEAR"
+        assert rm["publish_guard"]["force_draft"] is False
+        assert "release-flags.env" not in upl
+        assert "release-flags.env" not in "\n".join(sums_lines)
+        # 占位场景：三个目录只有 README.txt -> 门禁必须触发
+        ph = d / "placeholder_arts"
+        for name in ("SunUEFI-Module", "SunUEFI-ESP", "SunUEFI-Root-ubuntu-gnome"):
+            (ph / name).mkdir(parents=True)
+            (ph / name / "README.txt").write_text("placeholder\n")
+        ph_out = d / "placeholder_release"
+        run(tools / "port-release-assets.py", "--artifacts", ph,
+            "--out", ph_out, "--tag", "v0.0.0-placeholder",
+            "--policy", portroot / "config" / "release-policy.json", "--json")
+        ph_man = json.loads((ph_out / "manifest.json").read_text())
+        assert ph_man["status"] == "RELEASE_ASSETS_CONTAINS_PLACEHOLDERS"
+        assert ph_man["publish_guard"]["status"] == "GUARD_TRIGGERED"
+        assert ph_man["publish_guard"]["force_draft"] is True
+        ph_flags = (ph_out / "release-flags.env").read_text()
+        assert "FORCE_DRAFT=1" in ph_flags and "FORCE_PRERELEASE=1" in ph_flags
+        assert "GUARD_STATUS=GUARD_TRIGGERED" in ph_flags
+        assert "发布门禁已生效" in (ph_out / "RELEASE-NOTES.md").read_text()
+        assert "release-flags.env" not in (ph_out / "upload-files.txt").read_text()
         print("  [release-assets] 三 ZIP + 全局 SHA256 + manifest + Notes + 缺产物负例 OK")
+        print("  [release-guard] 真实产物 GUARD_CLEAR / 占位 GUARD_TRIGGERED + flags OK")
 
         # ---- 7. 隔离校验（需求3，正例 + 负例）----
         iso_script = tools / "port-check-isolation.py"
@@ -294,7 +326,36 @@ def main() -> int:
         assert any("sunuefi- 前缀" in v or "撞名" in v for v in rep2["violations"])
         print("  [isolation] 正例通过、非前缀 workflow 负例被拦截 OK")
 
-    print("\nSELFTEST OK —— 需求 1/2/3/4/5/7 的 port 层逻辑全部离线跑通")
+        # ---- 8. 真实编译接线器 port-full-build.sh --dry-run（离线验证契约）----
+        fb_fork = d / "fb_fork"
+        (fb_fork / "kernel").mkdir(parents=True)
+        (fb_fork / "port" / "config").mkdir(parents=True)
+        (fb_fork / "kernel" / "source.json").write_text(json.dumps({
+            "url": "https://example.invalid/linux-sm8750-piano.git",
+            "commit": "bf42598aceec58fd7392314de233e5fab3835938",
+            "branch": "piano/virt-1.0",
+            "config": "arch/arm64/configs/piano-diagnostic.config",
+            "release_config_fragments": ["arch/arm64/configs/piano-diagnostic.config",
+                                         "arch/arm64/configs/piano-release.config"],
+            "kernel_release": "7.2.14-piano56"}))
+        shutil.copy(profile, fb_fork / "port" / "config" / "port-profile.json")
+        fb_inputs = d / "fb_inputs"
+        fb_inputs.mkdir()
+        fb_script = portroot / "build" / "port-full-build.sh"
+        r4 = subprocess.run(["bash", str(fb_script), "--fork", str(fb_fork),
+                             "--inputs", str(fb_inputs), "--dry-run"],
+                            capture_output=True, text=True)
+        assert r4.returncode == 0, f"port-full-build.sh --dry-run 失败: {r4.stderr}"
+        assert "config fragments = 2" in r4.stdout
+        plan = json.loads((fb_inputs / "kernel-plan.json").read_text())
+        assert plan["kernel_release"] == "7.2.14-piano56"
+        assert plan["commit"] == "bf42598aceec58fd7392314de233e5fab3835938"
+        fb_env = (fb_inputs / "port-inputs.env").read_text()
+        assert "FULL_BUILD_STATUS=DRY_RUN" in fb_env
+        assert "ESP_IMAGE=" in fb_env and "ROOT_IMAGE=" in fb_env
+        print("  [full-build] --dry-run 元数据/源码契约/输出契约 OK")
+
+    print("\nSELFTEST OK —— 需求 1/2/3/4/5/7 + 真实编译接线 + 发布门禁 全部离线跑通")
     return 0
 
 
