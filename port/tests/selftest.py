@@ -411,6 +411,15 @@ def main() -> int:
             for token in ("SOURCE=upstream-release", f"UPSTREAM_TAG={tag}",
                           "DTB_STATUS=UPSTREAM_MERGED_DTB", "ESP_DIR=", "MODULE_ZIP="):
                 assert token in env, f"port-inputs.env 缺 {token}"
+            # 回归：env 必须能被 shell 直接 source。KERNEL_SOURCE 等值含空格，
+            # 不加引号会让 workflow 的 `source` 把 "+" 当命令（exit 127）。
+            chk = subprocess.run(
+                ["bash", "-c",
+                 'set -eu; . "$1"; test "$SOURCE" = upstream-release; '
+                 'test -n "$KERNEL_SOURCE"; test -n "$MODULE_ZIP"',
+                 "_", str(ur_inputs / "port-inputs.env")],
+                capture_output=True, text=True)
+            assert chk.returncode == 0, f"port-inputs.env 无法 source: {chk.stderr}"
             esp_manifest = json.loads((ur_inputs / "esp-tree/port-esp-manifest.json").read_text())
             assert esp_manifest["payload"]["magic"] == "SUNUEFI-LINUXv2"
             modzip = ur_inputs / f"SunUEFI-Piano-{tag}.zip"

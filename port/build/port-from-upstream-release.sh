@@ -194,8 +194,9 @@ MTOOLS_SKIP_CHECK=1 mcopy -i "$ESPIMG" -s "$INPUTS/esp-tree/EFI" ::
 SZ=$(stat -c %s "$ESPIMG")
 [ $((SZ % 4096)) -eq 0 ] || die "ESP 镜像未 4K 对齐: $SZ"
 grep -q '^ESP_IMAGE=' "$INPUTS/port-inputs.env" || die "缺 port-inputs.env"
-sed -i "s|^ESP_IMAGE=.*|ESP_IMAGE=$ESPIMG|" "$INPUTS/port-inputs.env"
-grep -q '^ROOT_STATE=' "$INPUTS/port-inputs.env" || echo "ROOT_STATE=$ROOT_STATE" >> "$INPUTS/port-inputs.env"
+# 值一律加引号：KERNEL_SOURCE 等含空格，裸写会让 workflow 的 source 把 "+" 当命令
+sed -i "s|^ESP_IMAGE=.*|ESP_IMAGE=\"$ESPIMG\"|" "$INPUTS/port-inputs.env"
+grep -q '^ROOT_STATE=' "$INPUTS/port-inputs.env" || echo "ROOT_STATE=\"$ROOT_STATE\"" >> "$INPUTS/port-inputs.env"
 info "  esp.raw = ${SZ}B (${ESP_SIZE_MIB}MiB)"
 
 python3 - "$INPUTS" "$UP_TAG" "$REPO" "$ROOT_STATE" <<'PY'

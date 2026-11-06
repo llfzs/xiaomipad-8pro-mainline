@@ -133,15 +133,18 @@
 
 **两条路径**：
 
-- `full_build=false`（默认）：只跑 port 层可离线部分，产物是**占位骨架**，用于验证
-  CI/发布链路；`RELEASE-NOTES.md` 标注"不可刷机"，发布门禁强制降级。
-- `full_build=true`：走上面的真实接线。**严格模式**，内核源码、交叉工具链、
-  `initramfs.cpio.gz` 等任一缺失都 `exit 1` 并给出指引，不再像旧版那样
-  "echo 示例 + `|| true`" 跑绿却不产出任何镜像。
+- `source=upstream-release`（默认，**上游活水**）：自动拉 `yzddmr6` 最新 Release
+  里由上游源码编译发布的成品，校验 `SHA256SUMS.assets` 后 UEFI 化，产出
+  **三产物真镜像**（ESP / root sparse / 真实 Module ZIP）。上游发新版自动跟随，
+  发布门禁 `GUARD_CLEAR`。详见 `UPSTREAM-RELEASE.md`。
+- `source=kernel-source`（高级）：走上面的真实接线，**严格模式**，内核源码、交叉工具链、
+  `initramfs.cpio.gz` 等任一缺失都 `exit 1` 并给出指引；需自备公共 runner 拿不到的输入
+  （root 镜像 / Module ZIP / 原厂 DTB / 合体 BOOT / UEFI FD），见 `RELEASE.md` 第 9 节。
 
-公共 runner 无法自动获得的输入（root 镜像 / Module ZIP / 原厂 DTB / 合体 BOOT / UEFI FD）
-仍需你的设备或本机提供，见 `RELEASE.md` 第 9 节。所有脚本只读上游文件、
-产物落在 `$RUNNER_TEMP`，**零上游路径写入**。
+无论哪条路径，所有脚本只读上游文件、产物落在 `$RUNNER_TEMP`，**零上游路径写入**。
+真机能否启动还取决于 initramfs 能否挂上 `sunuefi_root`（G1：上游 A 槽 ramdisk 可能
+只有几十字节，`upstream-adapt.json` 会标 `initramfs_suspicious`）、EFI Stub（G2）
+与合体 BOOT 头（G3）。
 
 ## 5. 推荐实施顺序
 

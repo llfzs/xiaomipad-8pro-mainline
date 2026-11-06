@@ -24,6 +24,7 @@ import gzip
 import hashlib
 import json
 import os
+import shlex
 import struct
 import subprocess
 import sys
@@ -315,7 +316,8 @@ def cmd_adapt(a) -> int:
         raise SystemExit("缺上游 *-boot.zip（下载/校验步骤未成功）")
     bootzip = boots[0]
     with zipfile.ZipFile(bootzip) as z:
-        names = z.namelist()
+        infos = z.infolist()
+        names = [i.filename for i in infos]
         def member(suffix):
             hit = [n for n in names if n.endswith(suffix)]
             return z.read(hit[0]) if hit else b""
@@ -325,6 +327,9 @@ def cmd_adapt(a) -> int:
         vendor_boot = member("boot/vendor_boot.img")
         ram_check = member("boot/boot-ram-check.img")
     log(f"boot.zip = {bootzip.name}，{len(names)} 个成员")
+    for i in sorted(infos, key=lambda x: x.filename):
+        if i.filename.startswith("boot/") and i.filename.endswith(".img"):
+            log(f"  {i.filename}: {i.file_size}B")
 
     # 2) 抽内核：优先正式 boot.img，缺则 boot-ram-check.img（同一套 kernel/initrd/DTB）
     candidates = [("boot.img", boot_img), ("boot-ram-check.img", ram_check)]
@@ -364,6 +369,14 @@ def cmd_adapt(a) -> int:
                 break
     if not ramdisk:
         raise SystemExit("未找到 initramfs（generic ramdisk），无法生成 SUNUEFI-LINUXv2 payload")
+    # 上游 v1.0.0 的 boot.zip 无独立 initramfs，A 槽三元组里抽出的 generic ramdisk
+    # 可能只有几十字节（空/占位）。不擅自把 vendor_boot fragment 拼成 initramfs，
+    # 而是显式告警并写进报告，避免把「能刷但起不来」伪装成已闭环（G1 契约）。
+    initramfs_suspect = len(ramdisk) < 4096
+    if initramfs_suspect:
+        log(f"!! 警告：抽出的 initramfs 仅 {len(ramdisk)}B，疑似空/占位 generic ramdisk")
+        log("   上游 boot.zip 无独立 initramfs；真实 ramdisk 可能在 vendor_boot fragment")
+        log("   或已编进内核。真机能否挂载 sunuefi_root 须按 PORTING-MAP.md 的 G1 验证")
     (inputs / "initramfs.cpio.gz").write_bytes(ramdisk)
 
     if not dtb:
@@ -412,8 +425,17 @@ def cmd_adapt(a) -> int:
         "KERNEL_SOURCE": used,
         "ROOT_STATUS": root_status,
     }
+    # 必须用 shlex.quote：KERNEL_SOURCE 之类的值含空格（"boot.img + init_boot.img"），
+    # 裸写会让 workflow 的 `source` 把 "+" 当命令执行（"+: command not found", 127）。
     (inputs / "port-inputs.env").write_text(
-        "".join(f"{k}={v}\n" for k, v in env.items()), encoding="utf-8")
+        "".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()), encoding="utf-8")
+
+    note = ("root 镜像为上游 root.sparse.img 原样透传；piano/piano 账号与 "
+            "sunuefi_root 挂载契约由 Module ZIP 的 service.sh 首次启动时注入。"
+            "真机引导需验证 G1 挂载 / G2 EFI Stub / G3 OS4.0.5 BOOT 头兼容。")
+    if initramfs_suspect:
+        note += ("【G1 高风险】initramfs 仅 %dB，疑似空 ramdisk，"
+                 "刷入后可能无法挂载 sunuefi_root。" % len(ramdisk))
 
     report = {
         "status": env["FULL_BUILD_STATUS"],
@@ -423,14 +445,13 @@ def cmd_adapt(a) -> int:
         "kernel_format": kfmt,
         "kernel_bytes": len(kernel),
         "initramfs_bytes": len(ramdisk),
+        "initramfs_suspicious": initramfs_suspect,
         "dtb_bytes": len(dtb),
         "esp_dir": str(esp_dir),
         "module": minfo,
         "root_image": str(root_image) if root_image else None,
         "root_status": root_status,
-        "note": "root 镜像为上游 root.sparse.img 原样透传；piano/piano 账号与 "
-                "sunuefi_root 挂载契约由 Module ZIP 的 service.sh 首次启动时注入。"
-                "真机引导需验证 G1 挂载 / G2 EFI Stub / G3 OS4.0.5 BOOT 头兼容。",
+        "note": note,
     }
     (inputs / "upstream-adapt.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

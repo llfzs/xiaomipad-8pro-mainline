@@ -118,10 +118,27 @@ cd release-assets && sha256sum -c SHA256SUMS
 该命令**不联网、不调用 gh、不碰设备**，只写 `release-assets/`；已纳入
 `tests/selftest.py` 的离线自检。
 
-## 9. 为什么 Release 里不是「能直接刷入的镜像」
+## 9. 产物是不是「能直接刷入的镜像」
 
-默认构建（`full_build=false`）只跑 port 层后处理与打包。三个产物 ZIP 各约 700 B，
-里面只有一个 `README.txt` 占位说明 + 目录级 `SHA256SUMS`。`manifest.json` 会写：
+### 默认路径产出真实镜像
+
+默认 `source=upstream-release` 会自动消费 `yzddmr6/xiaomipad-8pro-mainline` 最新 Release
+里**由上游源码编译发布的成品**（不写死 tag），经 `port/` 层 UEFI 化后产出三个真镜像：
+
+| 产物 | 内容 | 上游资产 / 来源 |
+|---|---|---|
+| `SunUEFI-ESP` | `esp.sparse.img`：FAT32 ESP 转 Android sparse，含 `SUNUEFI-LINUXv2` payload、裸 `Image`、合并 DTB、initramfs | `piano-ubuntu-<tag>-boot.zip` |
+| `SunUEFI-Root-<target>` | `root-<target>.sparse.img`：60 GiB ext4 Android sparse，**原样透传** | `piano-ubuntu-<tag>-rootfs.img.zst.part*` 拼接 zstd 解压 |
+| `SunUEFI-Module` | `SunUEFI-Piano-<tag>.zip`：真实模块（`piano/piano` 账号、`fstab`、`root-policy`、分区计划、切换脚本），首次启动注入 root | `port/` 生成 |
+
+此时 `manifest.json` 的 `status` = `RELEASE_ASSETS_READY`、发布门禁 `GUARD_CLEAR`，
+**不再是强制草稿 + 预发布**。Release 说明会写入本次消费的上游 tag，便于溯源。
+本地离线复现（不下载 3.5 GiB 分卷）见 `UPSTREAM-RELEASE.md`。
+
+### 历史问题：占位骨架
+
+早期版本把「从内核源码重编」当主路径（旧 `full_build=false` 默认），公共 runner 拿不到
+外部输入时退化为几百字节的占位骨架——三个产物 ZIP 各只有一个 `README.txt`：
 
 ```json
 "status": "RELEASE_ASSETS_CONTAINS_PLACEHOLDERS",
@@ -129,9 +146,29 @@ cd release-assets && sha256sum -c SHA256SUMS
 "warnings": ["存在占位产物，本 Release 仅验证 CI 链路，不可用于刷机"]
 ```
 
-这不是构建失败，而是**工程包定位**：它交付的是「可离线验证的移植骨架 + 桥接层」，
-用来证明 CI、三产物命名、Release 发布链路都跑通。真镜像需要下面这些**公共 runner
-无法自动获得**的输入（详见 `PORTING-MAP.md` 第 4、6 节）：
+发布门禁当时把它强制降级为草稿 + 预发布。**该问题的根源是构建输入源选错**，
+已通过默认路径改为消费上游 Release 成品解决；门禁作为兜底保留下来。
+
+### 真机边界（务必读）
+
+真实镜像 ≠ 真机一定能启动，仍有三个契约缺口（详见 `PORTING-MAP.md` 第 2、6 节）：
+
+- **G1 挂载契约（当前最高风险）**：上游 A 槽三元组里抽出的 `initramfs` 在 v1.0.0
+  只有几十字节，`upstream-adapt.json` 会标 `initramfs_suspicious: true` 并在报告
+  `note` 里写「G1 高风险」。刷入前必须确认 init 能挂上 `sunuefi_root`。
+- **G2**：内核 `CONFIG_EFI_STUB` / EFI Stub 是否可用。
+- **G3**：OS4.0.5 / Android 17 合体 BOOT 头兼容，须先 `piano-boot-repack probe`。
+
+### 高级路径：source=kernel-source
+
+只有显式选 `source=kernel-source` 时才走 `port/build/port-full-build.sh` 从内核源码重编：
+从 `kernel/source.json` 读固定 commit → clone/校验内核源码 → 检查交叉工具链 →
+跑 `tools/build-kernel.sh` → 生成 4K 对齐 FAT32 `esp.raw` → 写 `port-inputs.env`，
+workflow 再把 `--inputs/--esp-image/--root-image/--module-zip` 全量传给 `port-build.sh`。
+**任何前置条件缺失都直接失败并给出指引，绝不静默产出占位。**
+
+它需要的外部输入（公共 runner 无法自动获得，放进 `port/inputs/`，可用
+`external_inputs_dir` 改目录）：
 
 | 缺的输入 | 来源 |
 |---|---|
@@ -141,28 +178,6 @@ cd release-assets && sha256sum -c SHA256SUMS
 | `SunUEFI-Piano-*.zip` | 需 `git subtree` 引入 SunUEFI 引导层并 ARM64 交叉编译 Android 助手模块 |
 | 原厂 DTB overlay / 合体 BOOT / UEFI FD | **只能从你的设备提取**；Android 17 的 BOOT 头须先 `piano-boot-repack probe`（G3） |
 
-### 出真镜像的操作
-
-`full_build=true` 时由 `port/build/port-full-build.sh` 做真实接线（不再是旧版的
-echo 示例 + `|| true`）：从 `kernel/source.json` 读固定 commit → clone/校验内核源码 →
-检查交叉工具链 → 跑 `tools/build-kernel.sh` → 生成 4K 对齐 FAT32 `esp.raw` →
-写 `port-inputs.env`，workflow 再把 `--inputs/--esp-image/--root-image/--module-zip`
-全量传给 `port-build.sh`。**任何前置条件缺失都直接失败并给出指引，绝不静默产出占位。**
-
-1. 把你本机/自建 runner 构建好的产物放进 `port/inputs/`（默认目录，可用
-   `external_inputs_dir` 输入改）：
-   ```
-   initramfs.cpio.gz · root.ext4（或 root.sparse.img / root.image）
-   SunUEFI-Piano-*.zip
-   stock-base.dtb · stock-overlay.dtbo · ufdt   （可选，用于合并原厂 DTB）
-   ```
-   大镜像建议用 Git LFS、release asset 或自建 runner 预置，不要直接提交进 git。
-2. Actions → `SunUEFI build products` → 勾 `full_build=true`（可填 `external_inputs_dir`）→ 运行。
-3. 检查 `port-inputs-manifest.json` 的 `status`：
-   - `READY` = 三产物都有真实镜像；
-   - `PARTIAL_EXTERNAL_INPUTS` = 仍有输入缺失，对应产物仍是占位。
-4. 产物 ZIP 里应出现 `esp.sparse.img` / `root-<target>.sparse.img` / `SunUEFI-Piano-*.zip`，
-   而不再是 `README.txt`。此时 `manifest.json` 的 `status` 才是 `RELEASE_ASSETS_READY`。
 
 ### ⚠️ 账号注入的形态限制（需求 5）
 

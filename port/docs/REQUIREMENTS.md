@@ -55,14 +55,18 @@
 
 ## 诚实边界
 
-默认（`full_build=false`）在 GitHub Actions 上**一定能跑绿**的是：隔离校验、离线自检、
-三产物骨架打包（含占位说明）、artifact 上传，以及需求 7 的 Release 发布（占位时被
-**发布门禁强制降级为草稿 + 预发布**）。**这些产物不是可刷镜像**——`manifest.json`
-写 `RELEASE_ASSETS_CONTAINS_PLACEHOLDERS`，`RELEASE-NOTES.md` 明确警告"不可刷机"。
+默认（`source=upstream-release`）在 GitHub Actions 上**能跑绿**的是：隔离校验、离线自检、
+拉上游最新 Release 成品并逐个校验 sha256、UEFI 化、**三产物真镜像**打包、artifact 上传，
+以及需求 7 的 Release 发布（真镜像 `GUARD_CLEAR`，正式版）。产物是真实镜像文件，
+`manifest.json` 写 `RELEASE_ASSETS_READY`。
 
-`full_build=true` 走 `port/build/port-full-build.sh` 的真实编译接线，但仍需你提供
-公共 runner 拿不到的输入：本机构建的 `initramfs.cpio.gz`、`root.ext4`、
-`SunUEFI-Piano-*.zip`、原厂 DTB / 合体 BOOT / UEFI FD（后三者只能取自你的设备），
-以及 rootfs 构建所需的 sudo + apt 快照 + 专用 `mke2fs`。缺任一输入都会**明确失败**，
-不再静默产出占位。首次建议在 `ubuntu-24.04-arm` 或自建 ARM64 runner 上跑通，
-详见 `RELEASE.md` 第 9 节。真机刷写验证清单见 `PORTING-MAP.md` 第 6 节。
+但**真实镜像 ≠ 真机可启动**：G1 挂载契约（上游 A 槽 initramfs 可能只有几十字节，
+`upstream-adapt.json` 会标 `initramfs_suspicious: true`）、G2 EFI Stub、
+G3 OS4.0.5 合体 BOOT 头兼容仍须真机验证；本工程不编译 UEFI FD、不写合体 BOOT、
+不碰设备。真机刷写验证清单见 `PORTING-MAP.md` 第 6 节。
+
+只有 `source=kernel-source` 才走 `port/build/port-full-build.sh` 从内核源码重编，
+届时需自备公共 runner 拿不到的输入：本机构建的 `initramfs.cpio.gz`、`root.ext4`、
+`SunUEFI-Piano-*.zip`、原厂 DTB / 合体 BOOT / UEFI FD，以及 rootfs 构建所需的
+sudo + apt 快照 + 专用 `mke2fs`。缺任一输入都会**明确失败**，不静默产出占位，
+详见 `RELEASE.md` 第 9 节。
