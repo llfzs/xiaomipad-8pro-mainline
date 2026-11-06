@@ -22,15 +22,26 @@
 |---|---|
 | `SunUEFI-Module.zip` | Android 引导助手模块（原 `SunUEFI-Module/` 目录全部文件） |
 | `SunUEFI-ESP.zip` | `esp.sparse.img` + 目录级 `SHA256SUMS`（刷 `sunuefi_esp`） |
-| `SunUEFI-Root-<target>.zip` | `root-<target>.sparse.img` + 目录级 `SHA256SUMS`（刷 `sunuefi_root`） |
-| `manifest.json` | 汇总清单：各 ZIP 的 sha256、源文件、状态、tag / commit / run / 上游基线 |
-| `SHA256SUMS` | **全局**校验和，覆盖所有 ZIP 与 `manifest.json` |
-| `RELEASE-NOTES.md` | 发布说明：构建信息、产物表、校验和全文、占位警告、刷机红线 |
+| `SunUEFI-Root-<target>--*.part*` | `root-<target>.sparse.img` 实际约 7.88 GiB，超过 Release 单资产 2 GiB 上限，按 1,900,000,000 B 切分；目录内小文件平铺发布（刷 `sunuefi_root`） |
+| `manifest.json` | 汇总清单：各资产的 sha256、源文件、状态、tag / commit / run / 上游基线 |
+| `SHA256SUMS` | **全局**校验和，覆盖所有发布资产与 `manifest.json` |
+| `RELEASE-NOTES.md` | 发布说明：构建信息、产物表、分卷还原命令、校验和全文、占位警告、刷机红线 |
 
-**为什么必须打成 ZIP？** 三个产物目录里各有一个同名 `SHA256SUMS`，GitHub Release 的
+**为什么小产物要打成 ZIP？** 三个产物目录里各有一个同名 `SHA256SUMS`，GitHub Release 的
 asset 是平铺的，直接上传会互相覆盖。压成同名 ZIP 后每个目录自成一份，解压即得原始产物。
 ZIP 用 `STORED`（不压缩）+ 固定时间戳：sparse 镜像本身已稀疏编码，再压缩收益很小却要
 花几分钟，且固定时间戳让发布资产可复现。脚本流式写入，不把数 GB 镜像读进内存。
+
+**为什么大镜像要分卷？** GitHub Release 单资产上限 2 GiB，而上游 `root.sparse.img`
+逻辑 60 GiB / 实际 7.88 GiB，打成单个 ZIP 既超限又要多占一份磁盘。脚本对目录内超过
+1,900,000,000 B 的文件改为按字节切分 `.partN`（与上游 `assets-manifest.json` 的
+`part_bytes` 一致），**不再生成超大 ZIP**，并在 `RELEASE-NOTES.md` 给出还原命令：
+
+```bash
+cat SunUEFI-Root-<target>--root-<target>.sparse.img.part* > root-<target>.sparse.img
+```
+
+阈值可用 `--max-asset-bytes` 调整；离线自检用极小阈值覆盖该路径，无需真造 GB 级文件。
 
 ## 3. 权限
 

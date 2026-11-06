@@ -84,8 +84,8 @@ git tag -a v0.10.0-port2 -m "sync upstream + release" && git push origin v0.10.0
 ```
 
 `publish` job 会发布 `SunUEFI-Module.zip` / `SunUEFI-ESP.zip` /
-`SunUEFI-Root-*.zip` + `manifest.json` + `SHA256SUMS` + `RELEASE-NOTES.md`，
-并在说明里记录本次上游基线。同 tag 重跑用 `--clobber` 覆盖，不会失败。
+`SunUEFI-Root-*` 分卷 + `manifest.json` + `SHA256SUMS` + `RELEASE-NOTES.md`，
+并在说明里记录本次上游基线与分卷还原命令。同 tag 重跑用 `--clobber` 覆盖，不会失败。
 
 ## 校验同步正确性
 

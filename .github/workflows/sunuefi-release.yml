@@ -53,6 +53,11 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: 释放 runner 磁盘（root sparse 约 8GiB，分卷发布需额外空间）
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android 2>/dev/null || true
+          df -h .
+
       - name: 定位构建 run 并下载 SunUEFI-* 产物
         id: dl
         env:

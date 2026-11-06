@@ -303,6 +303,37 @@ def main() -> int:
         print("  [release-assets] 三 ZIP + 全局 SHA256 + manifest + Notes + 缺产物负例 OK")
         print("  [release-guard] 真实产物 GUARD_CLEAR / 占位 GUARD_TRIGGERED + flags OK")
 
+        # ---- 6b. Release 大资产分卷（超过单资产 2 GiB 上限，用小阈值离线覆盖）----
+        import os
+        split_arts = d / "split_arts"
+        for name in ("SunUEFI-Module", "SunUEFI-ESP", "SunUEFI-Root-ubuntu-gnome"):
+            (split_arts / name).mkdir(parents=True)
+            (split_arts / name / "SHA256SUMS").write_text("0  placeholder\n")
+        big = os.urandom(5200)
+        (split_arts / "SunUEFI-ESP" / "esp.sparse.img").write_bytes(big)
+        (split_arts / "SunUEFI-Root-ubuntu-gnome" /
+         "root-ubuntu-gnome.sparse.img").write_bytes(big)
+        split_out = d / "split_release"
+        run(tools / "port-release-assets.py", "--artifacts", split_arts,
+            "--out", split_out, "--tag", "v0.0.0-split",
+            "--policy", portroot / "config" / "release-policy.json",
+            "--max-asset-bytes", "1000", "--json")
+        sm = json.loads((split_out / "manifest.json").read_text())
+        parted = {n: r for n, r in sm["artifacts"].items() if r["parted"]}
+        assert len(parted) == 2, f"应有两个产物走分卷: {list(parted)}"
+        parts = list(split_out.glob("*.part*"))
+        assert parts and all(p.stat().st_size <= 1000 for p in parts), "分卷片超阈值"
+        stem = "SunUEFI-Root-ubuntu-gnome--root-ubuntu-gnome.sparse.img"
+        group = sorted(split_out.glob(stem + ".part*"),
+                       key=lambda p: int(p.name.rsplit("part", 1)[1]))
+        assert b"".join(p.read_bytes() for p in group) == big, "分卷还原不一致"
+        assert "还原分卷镜像" in (split_out / "RELEASE-NOTES.md").read_text()
+        sums = (split_out / "SHA256SUMS").read_text()
+        upl = (split_out / "upload-files.txt").read_text().splitlines()
+        assert all(n in sums for n in upl
+                   if n not in ("SHA256SUMS", "RELEASE-NOTES.md")), "SHA256 未覆盖分卷"
+        print("  [release-assets-split] 超上限自动分卷 + cat 还原 + SHA256 覆盖 OK")
+
         # ---- 7. 隔离校验（需求3，正例 + 负例）----
         iso_script = tools / "port-check-isolation.py"
         # 造一个「应用了移植层」的 mock 树

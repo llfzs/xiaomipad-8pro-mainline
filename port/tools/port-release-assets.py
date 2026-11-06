@@ -10,16 +10,19 @@ Release 的同名 asset 会互相覆盖。因此本脚本把**每个产物目录
   release-assets/
     SunUEFI-Module.zip            内含原目录全部文件（含其自身 SHA256SUMS）
     SunUEFI-ESP.zip
-    SunUEFI-Root-<target>.zip
-    manifest.json                 汇总清单（每个 zip 的 sha256、源文件、状态、构建元数据）
-    SHA256SUMS                    全局校验和（针对所有 zip + manifest.json）
-    RELEASE-NOTES.md              人类可读发布说明（含校验和、上游基线、安全提示）
+    SunUEFI-Root-<target>--*.part0..N   大镜像超过上限时按字节分卷（不打单个超大 ZIP）
+    manifest.json                 汇总清单（每个资产的 sha256、源文件、状态、构建元数据）
+    SHA256SUMS                    全局校验和（针对所有发布资产 + manifest.json）
+    RELEASE-NOTES.md              人类可读发布说明（含校验和、还原命令、上游基线、安全提示）
     upload-files.txt              每行一个待上传文件名，供 gh release create/upload 消费
     release-flags.env             发布门禁标记（CI 中间产物，不上传、不计入 SHA256SUMS）
 
 设计约束：
-  * ZIP 用 STORED 模式 + 固定时间戳，避免数 GB 镜像压缩耗时，且产物可复现；
+  * 小产物 ZIP 用 STORED 模式 + 固定时间戳，避免数 GB 镜像压缩耗时，且产物可复现；
     流式写入，不把整个镜像读进内存。
+  * GitHub Release 单资产上限 2 GiB：目录内任一文件 > 1,900,000,000 B（与上游
+    assets-manifest.json 的 part_bytes 一致）时，改为字节分卷 .partN + 小文件平铺，
+    RELEASE-NOTES.md 给出 `cat *.part* > 原文件名` 还原命令；--max-asset-bytes 可调阈值。
   * 严格校验 Module / ESP / 至少一个 Root 齐全（--allow-partial 仅供离线自检）。
   * 发布门禁：检测到占位产物时输出 release-flags.env（FORCE_DRAFT/FORCE_PRERELEASE），
     由 publish job source 后强制降级为草稿+预发布，避免骨架被当成正式版。
@@ -86,6 +89,69 @@ def make_zip(src: Path, dst: Path) -> list[str]:
     return names
 
 
+# GitHub Release 单资产上限 2 GiB；与上游 assets-manifest.json 的 part_bytes 对齐。
+# 超过则按字节切分为 .partN（不压缩，避免数 GB 镜像的压缩耗时与额外内存）。
+MAX_ASSET_BYTES = 1_900_000_000
+
+
+def split_large_file(src: Path, dst_stem: Path, limit: int = MAX_ASSET_BYTES):
+    """流式切分单个大文件为 .partN，返回 (parts, 整体 sha256, 总字节数)。"""
+    h = hashlib.sha256()
+    parts: list[Path] = []
+    total = 0
+    with src.open("rb") as f:
+        idx = 0
+        while True:
+            part = dst_stem.with_name(dst_stem.name + f".part{idx}")
+            written = 0
+            with part.open("wb") as o:
+                while written < limit:
+                    chunk = f.read(min(4 * 1024 * 1024, limit - written))
+                    if not chunk:
+                        break
+                    o.write(chunk)
+                    h.update(chunk)
+                    written += len(chunk)
+            if written == 0:
+                part.unlink(missing_ok=True)
+                break
+            total += written
+            parts.append(part)
+            idx += 1
+            if written < limit:
+                break
+    return parts, h.hexdigest(), total
+
+
+def make_parted_assets(d: Path, out: Path, limit: int = MAX_ASSET_BYTES):
+    """超大产物：不生成单个 ZIP（会超 2 GiB 上限），直接把目录内文件平铺/切分。
+
+    返回 (asset_paths, asset_rows, inner_names, restore_text)。
+    limit 可由 --max-asset-bytes 调小，便于离线自检覆盖分卷路径。
+    """
+    files = collect_files(d)
+    assets: list[Path] = []
+    rows: list[dict] = []
+    restore: list[str] = []
+    for p in files:
+        rel = p.relative_to(d).as_posix()
+        stem = out / f"{d.name}--{rel.replace('/', '_')}"
+        if p.stat().st_size > limit:
+            parts, digest, _ = split_large_file(p, stem, limit)
+            for q in parts:
+                assets.append(q)
+                rows.append({"name": q.name, "bytes": q.stat().st_size,
+                             "sha256": sha256(q)})
+            restore.append(f"cat {stem.name}.part* > {Path(rel).name}"
+                           f"   # 还原后 sha256={digest}")
+        else:
+            shutil.copyfile(p, stem)
+            assets.append(stem)
+            rows.append({"name": stem.name, "bytes": stem.stat().st_size,
+                         "sha256": sha256(stem)})
+    return assets, rows, [p.relative_to(d).as_posix() for p in files], "\n".join(restore)
+
+
 def artifact_status(names: list[str]) -> str:
     real = [n for n in names if n.endswith((".zip", ".img", ".sparse.img"))]
     if real:
@@ -125,23 +191,39 @@ def build_notes(meta: dict, artifacts: dict, policy: dict, sums_text: str) -> st
         "",
         "## 产物",
         "",
-        "每个 ZIP 内含该产物的全部文件（含其目录级 `SHA256SUMS`）；解压后即为 "
-        "`port-package-artifacts.py` 产出的原始目录内容。",
+        "小体积产物压成同名 ZIP（内含目录级 `SHA256SUMS`）；超过 Release 单文件 2 GiB "
+        "上限的大镜像改为字节分卷 `.part*`，按下方命令还原。",
         "",
         "| 文件 | 大小 | SHA256 | 状态 |",
         "|---|---|---|---|",
     ]
     for name, row in artifacts.items():
-        lines.append(f"| `{row['zip']}` | {human(row['bytes'])} | `{row['sha256']}` | {row['status']} |")
+        for ar in row["asset_rows"]:
+            lines.append(f"| `{ar['name']}` | {human(ar['bytes'])} | "
+                         f"`{ar['sha256']}` | {row['status']} |")
     lines += [
         "",
         "| 附加文件 | 说明 |",
         "|---|---|",
         "| `manifest.json` | 汇总清单（各产物源文件、状态、校验和、构建元数据） |",
-        "| `SHA256SUMS` | 全局校验和，覆盖所有 ZIP 与 `manifest.json` |",
+        "| `SHA256SUMS` | 全局校验和，覆盖所有发布资产与 `manifest.json` |",
         "| `RELEASE-NOTES.md` | 本文件 |",
         "",
     ]
+    restores = [(n, r["restore"]) for n, r in artifacts.items() if r.get("restore")]
+    if restores:
+        lines += [
+            "## 还原分卷镜像",
+            "",
+            "大镜像按 1,900,000,000 字节切分（与上游 `assets-manifest.json` 的 "
+            "`part_bytes` 一致，且低于 GitHub Release 单资产 2 GiB 上限）。",
+            "下载同一组 `.part*` 全部文件后，在空目录执行：",
+            "",
+            "```bash",
+        ]
+        for n, txt in restores:
+            lines += [f"# {n}", txt]
+        lines += ["```", ""]
     placeholders = [n for n, r in artifacts.items() if r["status"] == "PLACEHOLDER"]
     if placeholders and policy["notes"]["include_placeholder_warning"]:
         lines += [
@@ -186,6 +268,8 @@ def main() -> int:
     ap.add_argument("--commit", default="")
     ap.add_argument("--upstream-baseline", default="", help="上游同步基线描述（可选）")
     ap.add_argument("--allow-partial", action="store_true", help="放宽必需产物校验（仅自检用）")
+    ap.add_argument("--max-asset-bytes", type=int, default=MAX_ASSET_BYTES,
+                    help="单个 Release 资产字节上限，超过则分卷（默认 1900000000）")
     ap.add_argument("--force", action="store_true", help="输出目录非空时仍覆盖")
     ap.add_argument("--json", action="store_true", help="stdout 只输出 JSON 摘要")
     a = ap.parse_args()
@@ -221,16 +305,41 @@ def main() -> int:
 
     artifacts: dict = {}
     for d in dirs:
-        zip_path = out / f"{d.name}.zip"
-        inner = make_zip(d, zip_path)
-        artifacts[d.name] = {
-            "zip": zip_path.name,
-            "bytes": zip_path.stat().st_size,
-            "sha256": sha256(zip_path),
-            "source_dir": d.name,
-            "files": inner,
-            "status": artifact_status(inner),
-        }
+        limit = a.max_asset_bytes
+        files = collect_files(d)
+        oversized = any(p.stat().st_size > limit for p in files)
+        if oversized:
+            # 单个 ZIP 会超过 Release 单资产上限：改为字节分卷 + 平铺小文件
+            _assets, rows, inner, restore = make_parted_assets(d, out, limit)
+            artifacts[d.name] = {
+                "zip": f"{d.name}.zip",   # 逻辑产物名（兼容说明/manifest），实际按 assets 上传
+                "assets": [r["name"] for r in rows],
+                "asset_rows": rows,
+                "bytes": sum(r["bytes"] for r in rows),
+                "sha256": "",             # 分卷后无单一文件；各 part 校验和见 asset_rows
+                "parted": True,
+                "restore": restore,
+                "source_dir": d.name,
+                "files": inner,
+                "status": artifact_status(inner),
+            }
+        else:
+            zip_path = out / f"{d.name}.zip"
+            inner = make_zip(d, zip_path)
+            zsha = sha256(zip_path)
+            zbytes = zip_path.stat().st_size
+            artifacts[d.name] = {
+                "zip": zip_path.name,
+                "assets": [zip_path.name],
+                "asset_rows": [{"name": zip_path.name, "bytes": zbytes, "sha256": zsha}],
+                "bytes": zbytes,
+                "sha256": zsha,
+                "parted": False,
+                "restore": "",
+                "source_dir": d.name,
+                "files": inner,
+                "status": artifact_status(inner),
+            }
 
     placeholder_count = sum(1 for r in artifacts.values() if r["status"] == "PLACEHOLDER")
     status = ("RELEASE_ASSETS_CONTAINS_PLACEHOLDERS" if placeholder_count
@@ -297,7 +406,8 @@ def main() -> int:
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
 
     # 1) 全局 SHA256SUMS：所有 zip + manifest.json（不含自身、不含 notes）
-    sum_targets = sorted([out / r["zip"] for r in artifacts.values()]) + [manifest_path]
+    asset_names = sorted(n for r in artifacts.values() for n in r["assets"])
+    sum_targets = [out / n for n in asset_names] + [manifest_path]
     sums_text = "".join(f"{sha256(p)}  {p.name}\n" for p in sum_targets)
     (out / "SHA256SUMS").write_text(sums_text)
 
@@ -306,8 +416,12 @@ def main() -> int:
                                           encoding="utf-8")
 
     # 3) 待上传文件清单（每行一个文件名，不含本清单自身）
-    upload = [r["zip"] for r in artifacts.values()] + \
-             ["manifest.json", "SHA256SUMS", "RELEASE-NOTES.md"]
+    upload = asset_names + ["manifest.json", "SHA256SUMS", "RELEASE-NOTES.md"]
+    # 安全网：任何待上传资产都不得达到 GitHub Release 单文件 2 GiB 上限
+    too_big = [n for n in asset_names
+               if (out / n).stat().st_size >= 2 * 1024 * 1024 * 1024]
+    if too_big:
+        raise SystemExit("发布资产超过 2 GiB 上限，分卷逻辑异常: " + ", ".join(too_big))
     (out / "upload-files.txt").write_text("\n".join(upload) + "\n")
 
     summary = {
@@ -316,7 +430,9 @@ def main() -> int:
         "release_name": meta["release_name"],
         "out": str(out),
         "artifacts": {n: {"zip": r["zip"], "bytes": r["bytes"],
-                          "sha256": r["sha256"], "status": r["status"]}
+                          "sha256": r["sha256"], "status": r["status"],
+                          "assets": r["assets"], "parted": r["parted"],
+                          "restore": r["restore"]}
                       for n, r in artifacts.items()},
         "placeholder_count": placeholder_count,
         "publish_guard": publish_guard,

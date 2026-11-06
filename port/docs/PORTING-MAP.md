@@ -127,7 +127,8 @@
    └─ port-package-artifacts.py → SunUEFI-Module / -ESP / -Root-<target>（Android sparse）
       │
       ▼
-[发布]  port-release-assets.py → 三 ZIP + manifest + SHA256SUMS + RELEASE-NOTES
+[发布]  port-release-assets.py → 小产物 ZIP / 大镜像 .part* 分卷
+        + manifest + SHA256SUMS + RELEASE-NOTES（含 cat 还原命令）
         + release-flags.env（占位时 GUARD_TRIGGERED → 强制草稿+预发布）
 ```
 
