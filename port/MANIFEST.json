@@ -1,0 +1,20 @@
+{
+  "applied_by": "apply-port.sh",
+  "schema": 3,
+  "target_repo": "xiaomipad-8pro-mainline (fork)",
+  "upstream_kernel": "7.2.14-piano56 (linux-sm8750-piano)",
+  "sunuefi_source_commit": "(未提供 SunUEFI 路径)",
+  "mode": "patchless-self-contained-subtree",
+  "port_owned_namespaces": ["port/", ".github/workflows/sunuefi-*"],
+  "touched_upstream_files": "none（零上游文件修改，见 docs/WIRING-POINTS.txt）",
+  "requirements": {
+    "1_uefi_dual_boot": "port/tools/port-stage-esp.py + port-switch.sh",
+    "2_partitions": "sunuefi_esp/sunuefi_root (config/port-profile.json)",
+    "3_upstream_sync": "port/tools/port-sync-upstream.sh + port-check-isolation.py + workflows/sunuefi-sync-upstream.yml",
+    "4_three_artifacts": "port/tools/port-package-artifacts.py (SunUEFI-Module/-ESP/-Root-<target>)",
+    "5_login": "piano/piano + root piano (port/tools/port-inject-login.py)",
+    "6_github_actions": ".github/workflows/sunuefi-build.yml + sunuefi-sync-upstream.yml",
+    "7_release": "sunuefi-build.yml#publish + sunuefi-release.yml + port/tools/port-release-assets.py + config/release-policy.json + docs/RELEASE.md"
+  },
+  "status": "PORT_APPLIED_NOT_BUILT_NOT_FLASHED"
+}

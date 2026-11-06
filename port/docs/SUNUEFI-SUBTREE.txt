@@ -1,0 +1,1 @@
+# 未提供 SunUEFI 路径；按 PORTING-MAP.md 第 1 节用 git subtree 引入引导层。

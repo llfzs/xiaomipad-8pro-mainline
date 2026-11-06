@@ -1,0 +1,12 @@
+一次性配置（详见 port/docs/SYNC-UPSTREAM.md）：
+  git remote add upstream https://github.com/yzddmr6/xiaomipad-8pro-mainline.git
+  bash port/tools/port-sync-upstream.sh . --check   # 查更新
+  bash port/tools/port-sync-upstream.sh . --merge   # 合并（port/ 原样保留）
+  git push origin main                              # 触发 sunuefi-build.yml
+GitHub Secrets 可选配 SYNC_TOKEN（repo PAT），让同步后主动派发重建事件。
+
+发布 Release（需求 7，见 port/docs/RELEASE.md）：
+  git tag -a v0.10.0-port1 -m "SunUEFI port1" && git push origin v0.10.0-port1
+  # tag push -> sunuefi-build.yml 构建 + publish job 自动发布
+  # 或 Actions -> SunUEFI build products -> 勾 publish_release
+  # 或 Actions -> SunUEFI publish release -> 填 tag 从已有 run 补发（不重编译）

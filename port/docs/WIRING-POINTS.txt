@@ -1,0 +1,19 @@
+UEFI 移植接线点 —— 全部「不修改上游源码」（需求 3：同步不冲突）
+================================================================
+上一版曾要求人工改 5 处上游文件，本版已全部撤销，改为对上游「构建产物」做后处理：
+
+  1) 内核 EFI Stub：不改 kernel/source.json。CONFIG_EFI_STUB 作为构建期「只读校验项」
+     （见 config/port-profile.json 的 kernel_config_requirements），由 CI 检查产物；
+     确需开启时在你自己的内核 fork 分支里加，绝不写回上游目录。
+  2) 内核产物对接：port/tools/port-stage-esp.py 读取 build-kernel.sh/
+     prepare-boot-dtb.py/build-initramfs.sh 的产物，输出 ESP 布局（不写上游）。
+  3) rootfs 后处理：port/tools/port-inject-login.py（piano/piano + root piano）
+     + port-adapt-rootfs.py（fstab/root-policy）作用于「解出的 rootfs 目录」，
+     不改 ubuntu/、不改 build-rootfs-image.py 的校验逻辑。
+  4) 切换/分区：源仓库三元组轮换脚本保留不动（只「不调用」）；改由
+     port/tools/port-switch.sh + SunUEFI Android 助手模块负责；分区计划见
+     port-partition-plan.py（新建 sunuefi_esp/sunuefi_root，不动 userdata）。
+  5) 文档：不改上游 docs/；全部说明收进 port/docs/。
+
+唯一需要「真机构建时」人工闭环的仍是 PORTING-MAP.md 的三个契约缺口
+（G1 挂载契约 / G2 EFI Stub / G3 合体 BOOT 头），它们是验证动作，不是文件修改。
